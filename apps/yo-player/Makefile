@@ -18,7 +18,8 @@ INCLUDES := include ../../libs/simple-lib-app/include ../../libs/simple-lib-av/i
 
 CFILES := main.c home.c play.c search.c video-grid.c storage.c stream-select.c \
           downloads.c video-export-psl1ght.c extractor.c youtube.c sponsorblock.c \
-          subtitles.c chapters.c settings.c theme.c
+          subtitles.c chapters.c settings.c theme.c \
+          account.c account-oauth.c youtube-tv.c
 FONT_STUB_OFILES := cellfont_stub.o cellfont_libexport.o \
                     cellfontft_stub.o cellfontft_libexport.o
 
@@ -40,7 +41,11 @@ CFLAGS = -O2 -Wall -Wextra -std=gnu11 -mcpu=cell $(MACHDEP) $(INCLUDE) \
           -DPSL1GHT -DNDEBUG -include psl1ght_compat.h \
           -DBUILD_NAME=\"yo-player-psl1ght\" -DBUILD_STAMP=\"$(shell git -C $(ROOT) rev-parse --short HEAD 2>/dev/null || echo unknown)\"
 ASFLAGS = $(MACHDEP) -mregnames -mcpu=cell -Wa,-mcell $(INCLUDE)
-LDFLAGS = $(MACHDEP) -Wl,--gc-sections -Wl,-Map,$(notdir $@).map
+# The compiler driver links PSL1GHT's lv2-sprx.o as a start file, and its 0x28-byte
+# process PRX parameters would sit in front of lv2-sprx-modern.o's.  -B finds this
+# app's empty lv2-sprx.o first, so the installed toolchain stays untouched.
+STARTFILES := startfiles
+LDFLAGS = $(MACHDEP) -B$(BUILDDIR)/$(STARTFILES)/ -Wl,--gc-sections -Wl,-Map,$(notdir $@).map
 PROJECT_LIBDIRS := $(ROOT)/libs/simple-lib-app/build/psl1ght \
                    $(ROOT)/libs/simple-lib-av/build/psl1ght \
                    $(ROOT)/libs/simple-lib-https/build/psl1ght \
@@ -119,6 +124,10 @@ $(OUTPUT).self: $(OUTPUT).elf
 		$(BUILDDIR)/$(notdir $<) --sdk 0x00475001
 	@$(SELF) $(BUILDDIR)/$(notdir $<) $@
 	@$(FSELF) $(BUILDDIR)/$(notdir $<) $(basename $@).fake.self
-$(OUTPUT).elf: $(OFILES) $(APP_LIB) $(AV_LIB) $(HTTPS_LIB) $(CORE_LIB)
+$(STARTFILES)/lv2-sprx.o: lv2-sprx-empty.S
+	@mkdir -p $(STARTFILES)
+	@$(CC) -c $(ASFLAGS) $< -o $@
+
+$(OUTPUT).elf: $(OFILES) $(APP_LIB) $(AV_LIB) $(HTTPS_LIB) $(CORE_LIB) | $(STARTFILES)/lv2-sprx.o
 -include $(DEPENDS)
 endif

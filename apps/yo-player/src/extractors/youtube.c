@@ -14,6 +14,9 @@
 #include "string-utilities.h"   // strCopy
 #include "dbg.h"                // logInfo (resolve diagnostics)
 #include "vfs.h"                // readFile/writeFile/deleteFile (persist the visitor session)
+#include "account.h"            // getAccessToken (signed-in feeds)
+#include "account-oauth.h"      // OAUTH_ACCESS_TOKEN_MAX
+#include "youtube-tv.h"         // parseTvTiles
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -681,4 +684,51 @@ static int getChannel(const char *channelId, const char *token, SearchResults *o
    return postAndParse(BROWSE_URL, body, bodyLen, out);
 }
 
-const Extractor youtubeExtractor = { "youtube", matches, extract, search, fetchTrending, getChannel };
+// ---- signed-in account feeds ----
+// YouTube only accepts an OAuth bearer token from the TV client (WEB answers 400 with one), and the TV
+// client answers in its own tile layout, read by youtube-tv.c. Playback stays on the anonymous player
+// client above: the account is only for browsing.
+static int postTvBrowse(const char *body, int bodyLen, const char *accessToken, char *resp, int *respLen, int *status)
+{
+   char authorization[OAUTH_ACCESS_TOKEN_MAX + 8];
+   snprintf(authorization, sizeof authorization, "Bearer %s", accessToken);
+   HttpHeader headers[] = {
+      { "Content-Type", "application/json" },
+      { "User-Agent", TV_USER_AGENT },
+      { "X-YouTube-Client-Name", TV_CLIENT_NAME_ID },
+      { "X-YouTube-Client-Version", TV_CLIENT_VERSION },
+      { "Authorization", authorization },
+      { "Accept-Encoding", "identity" },
+   };
+   return fetchHttp("POST", BROWSE_URL, headers, sizeof headers / sizeof headers[0], body, bodyLen, resp, RESP_CAP, respLen, status);
+}
+
+static int fetchAccountFeed(AccountFeed feed, const char *continuation, SearchResults *out)
+{
+   memset(out, 0, sizeof *out);
+   char body[MAX_CONTINUATION + 512];
+   int bodyLen = buildTvBrowseBody(body, sizeof body, feed, continuation);
+   if (bodyLen < 0) return -1;
+
+   char accessToken[OAUTH_ACCESS_TOKEN_MAX];
+   if (getAccessToken(accessToken, sizeof accessToken, 0) != 0) return -1;
+
+   char *resp = malloc(RESP_CAP);
+   if (!resp) return -1;
+
+   int respLen = 0, status = 0;
+   int rc = postTvBrowse(body, bodyLen, accessToken, resp, &respLen, &status);
+   if (rc == 0 && status == 401 && getAccessToken(accessToken, sizeof accessToken, 1) == 0)   // expired early: renew once
+      rc = postTvBrowse(body, bodyLen, accessToken, resp, &respLen, &status);
+   if (rc < 0 || status != 200) {
+      logError("[yt] account feed %d rc=%d status=%d\n", (int)feed, rc, status);
+      free(resp);
+      return rc < 0 ? rc : -status;
+   }
+
+   parseTvTiles(resp, respLen, out);
+   free(resp);
+   return 0;
+}
+
+const Extractor youtubeExtractor = { "youtube", matches, extract, search, fetchTrending, getChannel, fetchAccountFeed };

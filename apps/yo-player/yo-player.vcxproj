@@ -49,6 +49,9 @@
    <ClCompile Include="src\video-export.c" />
    <ClCompile Include="src\extractor.c" />
    <ClCompile Include="src\extractors\youtube.c" />
+   <ClCompile Include="src\extractors\youtube-tv.c" />
+   <ClCompile Include="src\account.c" />
+   <ClCompile Include="src\account-oauth.c" />
    <ClCompile Include="src\sponsorblock.c" />
    <ClCompile Include="src\subtitles.c" />
    <ClCompile Include="src\chapters.c" />

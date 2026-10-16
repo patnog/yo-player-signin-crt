@@ -39,3 +39,11 @@ int getChannelVideos(const char *channelId, const char *token, SearchResults *ou
          return registry[i]->getChannel(channelId, token, out);
    return -1;
 }
+
+int getAccountFeed(AccountFeed feed, const char *continuation, SearchResults *out)
+{
+   for (unsigned i = 0; i < sizeof registry / sizeof registry[0]; i++)
+      if (registry[i]->getAccountFeed)
+         return registry[i]->getAccountFeed(feed, continuation, out);
+   return -1;
+}

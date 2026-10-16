@@ -10,6 +10,7 @@
 #include <sys/ppu_thread.h>
 #include <sys/synchronization.h>
 #include <sys/timer.h>
+#include <sys/sys_time.h>   // getTimeUs
 
 // background plugin threads. 0x400 is the conventional vsh-plugin priority
 // (matches webMAN/cobra). lower number = higher priority on lv2.
@@ -80,6 +81,16 @@ static inline int unlock(sys_lwmutex_t *m)      { return sys_lwmutex_unlock(m); 
 static inline void exitThread(void)     { sys_ppu_thread_exit(0); }
 static inline void sleepMs(unsigned ms) { sys_timer_usleep(ms * 1000); }
 static inline void yieldThread(void)    { sys_ppu_thread_yield(); }
+
+// microseconds since the epoch, from the wall clock. For timestamps and for
+// pacing work that must not depend on how often a loop happens to come round.
+static inline uint64_t getTimeUs(void)
+{
+   sys_time_sec_t seconds;
+   sys_time_nsec_t nanoseconds;
+   sys_time_get_current_time(&seconds, &nanoseconds);
+   return (uint64_t)seconds * 1000000ull + nanoseconds / 1000;
+}
 
 // join a previously-spawned joinable thread, discarding its exit status.
 // callers that need the status can still use sys_ppu_thread_join directly,

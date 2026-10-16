@@ -5,6 +5,7 @@
 #include "screens/play.h"
 #include "video-grid.h"
 #include "storage.h"
+#include "account.h"
 #include "downloads.h"
 #include "ui/button-hints.h"
 #include "ui/console-glyphs.h"
@@ -30,28 +31,46 @@
 #define HINT_TEXT     18
 
 static const char *TrendingNames[TREND_COUNT] = { "Gaming", "Sports", "Podcasts" };
+static const char *AccountNames[ACCOUNT_FEED_COUNT] = { "Recommended", "Subscriptions", "History", "Watch Later" };
 
-// home categories = the trending feeds plus a Subscriptions feed and the Watch Later queue.
+// home categories = the trending feeds, a Subscriptions feed and the Watch Later queue kept on this PS3,
+// and - when signed in - the account's own feeds.
 #define HOME_SUBS        TREND_COUNT
 #define HOME_WATCHLATER  (TREND_COUNT + 1)
-#define HOME_CAT_COUNT   (TREND_COUNT + 2)
+#define HOME_ACCOUNT     (TREND_COUNT + 2)                      // first account feed; + AccountFeed
+#define HOME_CAT_COUNT   (HOME_ACCOUNT + ACCOUNT_FEED_COUNT)
 #define SUBS_PER_CHANNEL 8      // latest videos pulled from each subscribed channel
+
+// the L1/R1 cycle. signed out it is the original app's; signed in, the account feeds lead.
+static const int SignedOutOrder[] = { HOME_SUBS, HOME_WATCHLATER, TREND_GAMING, TREND_SPORTS, TREND_PODCASTS };
+static const int SignedInOrder[]  = {
+   HOME_ACCOUNT + ACCOUNT_FEED_HOME, HOME_ACCOUNT + ACCOUNT_FEED_SUBSCRIPTIONS, HOME_ACCOUNT + ACCOUNT_FEED_HISTORY,
+   HOME_ACCOUNT + ACCOUNT_FEED_WATCH_LATER, HOME_SUBS, HOME_WATCHLATER, TREND_GAMING, TREND_SPORTS, TREND_PODCASTS,
+};
 
 // each category's fully-loaded results, so returning to a tab skips the feed fetch (thumbnails still refetch).
 static SearchResults categoryCache[HOME_CAT_COUNT];
 static int           categoryCached[HOME_CAT_COUNT];
 static int           subsRevisionSeen;         // subscriptions revision the cached HOME_SUBS feed was built at
 static int           watchLaterRevisionSeen;   // watch-later revision the cached HOME_WATCHLATER feed was built at
+static int           accountRevisionSeen;      // sign-in state the category order + account caches belong to
 
 static struct {
    VideoGrid grid;
    int       category;
    int       screenW, screenH;
+   int       accountOpen;   // the sign-in / account panel is showing
 } home;
 
 static Font        uiFont;
 static Label       titleLabel, statusLabel;
 static ButtonHints hints;
+static int         accountHint;   // index of the Select hint ("Sign in" / "Account")
+
+// the account panel
+static Label       panelTitle, panelLine1, panelLine2, panelCode, panelFooter;
+static ButtonHints panelHints;
+static int         panelConfirmHint, panelBackHint;
 
 // approximate seconds-ago from a "N unit ago" string. approximate is fine here (unlike a precise date sort):
 // it only needs to group recent above old across channels. unknown/live sorts last.
@@ -116,6 +135,7 @@ static int fetchSubscriptions(SearchResults *out)
 static int homeFetch(const char *token, SearchResults *out, void *user)
 {
    (void)user;
+   if (home.category >= HOME_ACCOUNT)    return getAccountFeed((AccountFeed)(home.category - HOME_ACCOUNT), token, out);
    if (home.category == HOME_SUBS)       return fetchSubscriptions(out);
    if (home.category == HOME_WATCHLATER) return getWatchLater(out) > 0 ? 0 : -1;
    return getTrending(home.category, token, out);
@@ -123,9 +143,12 @@ static int homeFetch(const char *token, SearchResults *out, void *user)
 
 static void setHeading(void)
 {
+   // signed in, the account has its own Subscriptions and Watch Later, so name the PS3's copies apart
+   const char *local = isSignedIn() ? " \xe2\x80\xa2 this PS3" : "";
    char heading[128];
-   if      (home.category == HOME_SUBS)       snprintf(heading, sizeof heading, "Subscriptions");
-   else if (home.category == HOME_WATCHLATER) snprintf(heading, sizeof heading, "Watch Later");
+   if      (home.category >= HOME_ACCOUNT)    snprintf(heading, sizeof heading, "%s", AccountNames[home.category - HOME_ACCOUNT]);
+   else if (home.category == HOME_SUBS)       snprintf(heading, sizeof heading, "Subscriptions%s", local);
+   else if (home.category == HOME_WATCHLATER) snprintf(heading, sizeof heading, "Watch Later%s", local);
    else                                       snprintf(heading, sizeof heading, "Trending \xe2\x80\xa2 %s", TrendingNames[home.category]);
    setLabelText(&titleLabel, heading);
 }
@@ -148,8 +171,110 @@ static void cacheCurrent(void)
 static void switchCategory(int delta)
 {
    cacheCurrent();
-   home.category = (home.category + delta + HOME_CAT_COUNT) % HOME_CAT_COUNT;
+   const int *order = isSignedIn() ? SignedInOrder : SignedOutOrder;
+   int count = isSignedIn() ? (int)(sizeof SignedInOrder / sizeof SignedInOrder[0])
+                            : (int)(sizeof SignedOutOrder / sizeof SignedOutOrder[0]);
+   int position = 0;
+   while (position < count && order[position] != home.category) position++;
+   if (position == count) position = 0;   // the category left the cycle (signed out): restart it
+   home.category = order[(position + delta + count) % count];
    loadCategory();
+}
+
+// signed in or out (here, or a revoked token found by a feed request): the account caches belong to the
+// old state, so drop them and land on the first tab of the new cycle.
+static void applyAccountChange(void)
+{
+   accountRevisionSeen = getAccountRevision();
+   for (int feed = 0; feed < ACCOUNT_FEED_COUNT; feed++) categoryCached[HOME_ACCOUNT + feed] = 0;
+   setButtonHintCaption(&hints, accountHint, isSignedIn() ? "Account" : "Sign in");
+   home.category = isSignedIn() ? HOME_ACCOUNT + ACCOUNT_FEED_HOME : HOME_SUBS;
+   loadCategory();
+}
+
+// ---- account panel (Select) ----
+
+#define PANEL_W 820
+#define PANEL_H 360
+
+// setLabelText re-rasterises, so the countdown only pays for it once a second
+static void setLabelIfChanged(Label *label, const char *text)
+{
+   if (strcmp(label->text, text) != 0) setLabelText(label, text);
+}
+
+static void openAccountPanel(void)
+{
+   home.accountOpen = 1;
+   if (!isSignedIn()) beginSignIn();
+}
+
+static void closeAccountPanel(void)
+{
+   cancelSignIn();
+   home.accountOpen = 0;
+}
+
+static void updateAccountPanel(void)
+{
+   SignInStatus status;
+   getSignInStatus(&status);
+   int retryable = status.stage == SIGNIN_DENIED || status.stage == SIGNIN_EXPIRED || status.stage == SIGNIN_FAILED;
+
+   if (status.stage == SIGNIN_DONE) { home.accountOpen = 0; return; }   // applyAccountChange shows the new feeds
+   if (isPadButtonPressed(PAD_BTN_CIRCLE)) { closeAccountPanel(); return; }
+   if (isPadButtonPressed(PAD_BTN_CROSS)) {
+      if (isSignedIn())   { signOut(); home.accountOpen = 0; }
+      else if (retryable) beginSignIn();
+   }
+}
+
+static void drawAccountPanel(void)
+{
+   SignInStatus status;
+   getSignInStatus(&status);
+
+   const char *title = "Sign in to YouTube", *line1 = "", *line2 = "", *code = "", *confirm = NULL;
+   char url[96] = "", footer[64] = "";
+   if (isSignedIn()) {
+      title   = "Signed in to YouTube";
+      line1   = "Recommended, Subscriptions, History and Watch Later";
+      line2   = "come from your account. Videos still play signed out.";
+      confirm = "Sign out";
+   } else if (status.stage == SIGNIN_WAITING) {
+      // "https://www.google.com/device" reads better without the scheme
+      const char *shown = strstr(status.verificationUrl, "://");
+      strCopy(url, sizeof url, shown ? shown + 3 : status.verificationUrl);
+      line1 = "On your phone or computer, go to";
+      line2 = url;
+      code  = status.userCode;
+      snprintf(footer, sizeof footer, "and enter this code. It expires in %d:%02d.", status.secondsLeft / 60, status.secondsLeft % 60);
+   } else if (status.stage == SIGNIN_DENIED)  { line1 = "Sign-in was declined on the consent screen."; confirm = "Try again"; }
+   else if (status.stage == SIGNIN_EXPIRED)   { line1 = "The code expired before it was entered.";    confirm = "Try again"; }
+   else if (status.stage == SIGNIN_FAILED)    { line1 = "Couldn't reach Google. Check the connection."; confirm = "Try again"; }
+   else                                       { line1 = "Getting a sign-in code..."; }
+
+   setLabelIfChanged(&panelTitle, title);
+   setLabelIfChanged(&panelLine1, line1);
+   setLabelIfChanged(&panelLine2, line2);
+   setLabelIfChanged(&panelCode, code);
+   setLabelIfChanged(&panelFooter, footer);
+   setButtonHintShown(&panelHints, panelConfirmHint, confirm != NULL);
+   if (confirm && strcmp(panelHints.hints[panelConfirmHint].caption.text, confirm) != 0)
+      setButtonHintCaption(&panelHints, panelConfirmHint, confirm);
+   const char *back = (status.stage == SIGNIN_STARTING || status.stage == SIGNIN_WAITING) ? "Cancel" : "Close";
+   if (strcmp(panelHints.hints[panelBackHint].caption.text, back) != 0) setButtonHintCaption(&panelHints, panelBackHint, back);
+
+   int x = (home.screenW - PANEL_W) / 2, y = (home.screenH - PANEL_H) / 2, centerX = home.screenW / 2;
+   fillGfxRectangle(0, 0, home.screenW, home.screenH, activeTheme->scrim);
+   fillGfxRectangle(x, y, PANEL_W, PANEL_H, activeTheme->appBg);
+   fillGfxRectangle(x, y, PANEL_W, 4, activeTheme->accent);
+   drawLabelCentered(&panelTitle, centerX, y + 30);
+   drawLabelCentered(&panelLine1, centerX, y + 92);
+   if (line2[0])  drawLabelCentered(&panelLine2, centerX, y + 128);
+   if (code[0])   drawLabelCentered(&panelCode, centerX, y + 178);
+   if (footer[0]) drawLabelCentered(&panelFooter, centerX, y + 252);
+   drawButtonHints(&panelHints, home.screenW);
 }
 
 // OSK confirmed: a link plays directly, anything else opens a search.
@@ -176,8 +301,19 @@ static void initHome(void)
    addButtonHint(&hints, getConsoleGlyph(GLYPH_TRIANGLE), "Channel");
    addButtonHint(&hints, getConsoleGlyph(GLYPH_R3),       "Download");
    addButtonHint(&hints, getConsoleGlyph(GLYPH_START),    "Search");
+   accountHint = addButtonHint(&hints, getConsoleGlyph(GLYPH_SELECT), isSignedIn() ? "Account" : "Sign in");
    addButtonHint(&hints, getConsoleGlyph(GLYPH_L1),       "");
    addButtonHint(&hints, getConsoleGlyph(GLYPH_R1),       "Category");
+
+   int panelY = (home.screenH - PANEL_H) / 2;
+   initLabel(&panelTitle,  &uiFont, 0, 0, PANEL_W, AUTO, 30, activeTheme->textPrimary,   TEXT_NOWRAP, "");
+   initLabel(&panelLine1,  &uiFont, 0, 0, PANEL_W, AUTO, 22, activeTheme->textSecondary, TEXT_NOWRAP, "");
+   initLabel(&panelLine2,  &uiFont, 0, 0, PANEL_W, AUTO, 22, activeTheme->textPrimary,   TEXT_NOWRAP, "");
+   initLabel(&panelCode,   &uiFont, 0, 0, PANEL_W, AUTO, 56, activeTheme->textPrimary,   TEXT_NOWRAP, "");
+   initLabel(&panelFooter, &uiFont, 0, 0, PANEL_W, AUTO, 20, activeTheme->textSecondary, TEXT_NOWRAP, "");
+   initButtonHints(&panelHints, &uiFont, panelY + PANEL_H - 48, HINT_GLYPH_H, HINT_TEXT, activeTheme->textSecondary);
+   panelConfirmHint = addButtonHint(&panelHints, getConsoleGlyph(GLYPH_CROSS),  "Try again");
+   panelBackHint    = addButtonHint(&panelHints, getConsoleGlyph(GLYPH_CIRCLE), "Close");
 
    initVideoGrid(&home.grid, &uiFont, MARGIN_X, GRID_TOP, home.screenW - 2 * MARGIN_X, home.screenH - GRID_TOP);
    setGridWatchedPredicate(&home.grid, isWatched);
@@ -185,16 +321,22 @@ static void initHome(void)
 
    subsRevisionSeen = getSubscriptionsRevision();
    watchLaterRevisionSeen = getWatchLaterRevision();
-   home.category = HOME_SUBS;   // always start on Subscriptions
+   accountRevisionSeen = getAccountRevision();
+   // signed in, start on the account's Recommended feed; otherwise on Subscriptions, as before
+   home.category = isSignedIn() ? HOME_ACCOUNT + ACCOUNT_FEED_HOME : HOME_SUBS;
    loadCategory();
 }
 
 static void updateHome(void)
 {
    updateDownloadOverlay();
+   updateSignIn();
+   if (getAccountRevision() != accountRevisionSeen) applyAccountChange();
+   if (home.accountOpen) { updateAccountPanel(); return; }
    if (oskInputActive()) return;
 
    if (isPadButtonPressed(PAD_BTN_START)) oskInputBegin("Search YouTube", "", onQueryEntered);
+   if (isPadButtonPressed(PAD_BTN_SELECT)) { openAccountPanel(); return; }
 
    // L1/R1 stay responsive even mid-load (the source swap is non-blocking)
    if      (isPadButtonPressed(PAD_BTN_R1)) { switchCategory(1);  return; }
@@ -213,7 +355,8 @@ static void updateHome(void)
       return;
    }
    if (isPadButtonPressed(PAD_BTN_R3)) { if (!selected->isLive) enqueueDownload(selected); return; }   // live can't be downloaded
-   if (isPadButtonPressed(PAD_BTN_TRIANGLE)) { cacheCurrent(); openChannelFor(selected); return; }
+   // Recommended tiles don't say which channel they are from
+   if (isPadButtonPressed(PAD_BTN_TRIANGLE)) { if (selected->channelId[0]) { cacheCurrent(); openChannelFor(selected); } return; }
    if (isPadButtonPressed(PAD_BTN_CROSS)) {
       markWatched(selected->videoId);
       stopVideoGrid(&home.grid);   // no per-call http fetch may overlap the http media stream during playback
@@ -233,6 +376,7 @@ static void drawHome(void)
    }
    drawButtonHints(&hints, home.screenW);
    drawDownloadOverlay(home.screenW);
+   if (home.accountOpen) drawAccountPanel();
 }
 
 static void suspendHome(void) { stopVideoGrid(&home.grid); }   // free the http pools for the pushed screen
@@ -260,8 +404,14 @@ static void termHome(void)
 {
    termVideoGrid(&home.grid);
    termButtonHints(&hints);
+   termButtonHints(&panelHints);
    freeLabel(&titleLabel);
    freeLabel(&statusLabel);
+   freeLabel(&panelTitle);
+   freeLabel(&panelLine1);
+   freeLabel(&panelLine2);
+   freeLabel(&panelCode);
+   freeLabel(&panelFooter);
    closeFont(&uiFont);
 }
 

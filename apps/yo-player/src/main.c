@@ -23,6 +23,7 @@
 #include "screen-manager.h"
 #include "screens/home.h"
 #include "storage.h"
+#include "account.h"
 #include "settings.h"
 #include "downloads.h"
 #include "video-export.h"
@@ -141,6 +142,7 @@ int main(int argc, char **argv)
 
    initStats(5, 5, 14, activeTheme->textSecondary);
    initStorage();          // prefs (last category) + watch history, under /dev_hdd0/tmp/yo-player/
+   initAccount();          // saved YouTube sign-in, if any (account.txt beside the prefs)
    loadSettings();         // user-editable settings.txt (created with defaults on first launch)
    loadConsoleGlyphs();    // decode the console's own button glyphs for the on-screen hints
    initVideoExport();      // resolves the download staging folder, so it runs before initDownloads
@@ -164,6 +166,7 @@ int main(int argc, char **argv)
    }
 
    changeScreen(NULL);
+   shutdownAccount();     // stop a sign-in poll before the http layer goes away
    shutdownDownloads();   // cancel + join any in-flight download before the http/vfs layers go away
    shutdownVideoExport();
    freeConsoleGlyphs();

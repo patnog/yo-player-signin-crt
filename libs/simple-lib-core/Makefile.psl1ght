@@ -12,7 +12,7 @@ SOURCES  := src
 INCLUDES := include ../../apps/yo-player/psl1ght/include
 
 CFILES := dbg.c network.c printf.c dir-playlist.c vfs.c vfs-init-psl1ght.c \
-          cellfs.c http.c http-stream.c zip.c
+          cellfs.c http.c http-stream.c zip.c json.c
 
 CFLAGS = -O2 -Wall -Wextra -std=gnu11 -mcpu=cell $(MACHDEP) $(INCLUDE) \
           -DPSL1GHT -DNDEBUG -include psl1ght_compat.h \

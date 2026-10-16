@@ -98,6 +98,15 @@ typedef enum {
    CHANNEL_SORT_COUNT
 } ChannelSort;
 
+// the signed-in account's own feeds (see account.h). keep ACCOUNT_FEED_IDS (youtube.c) in this order.
+typedef enum {
+   ACCOUNT_FEED_HOME,            // Recommended: what youtube.com's home page shows the account
+   ACCOUNT_FEED_SUBSCRIPTIONS,   // latest uploads from the account's subscriptions
+   ACCOUNT_FEED_HISTORY,         // the account's watch history
+   ACCOUNT_FEED_WATCH_LATER,     // the account's Watch Later playlist
+   ACCOUNT_FEED_COUNT
+} AccountFeed;
+
 typedef struct Extractor {
    const char *name;                                    // "youtube"
    int (*matches)(const char *input);                   // claim this url/id?
@@ -107,6 +116,8 @@ typedef struct Extractor {
    int (*getTrending)(TrendingCategory category, const char *continuation, SearchResults *out);
    // a channel's Videos feed. token NULL = first page (Latest); else a sort-chip or next-page token.
    int (*getChannel)(const char *channelId, const char *token, SearchResults *out);
+   // a signed-in account feed. continuation as for search. -1 when signed out.
+   int (*getAccountFeed)(AccountFeed feed, const char *continuation, SearchResults *out);
 } Extractor;
 
 // picks the first registered extractor that claims input, or NULL.
@@ -121,3 +132,7 @@ int getTrending(TrendingCategory category, const char *continuation, SearchResul
 // a channel's Videos feed. token NULL = first page; else a sort-chip token (SearchResults.sortTokens) or a
 // next-page continuation. the first page also fills out->sortTokens. 0 ok, negative on error.
 int getChannelVideos(const char *channelId, const char *token, SearchResults *out);
+
+// a signed-in account feed (see AccountFeed). continuation as above. 0 ok; negative on error or when
+// signed out. blocking: call from a worker thread.
+int getAccountFeed(AccountFeed feed, const char *continuation, SearchResults *out);
