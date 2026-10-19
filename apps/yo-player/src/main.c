@@ -118,7 +118,18 @@ int main(int argc, char **argv)
    initTheme();                  // palette from themes.txt: every colour below reads activeTheme
    BOOT_MARK("theme\n");
 
-   int netRc = initNet();
+   // Mark both sides of module loading and network initialisation separately. If
+   // sysmodule loading fails, keep the UI usable offline instead of calling into
+   // an unavailable sys_net entry point.
+   int netRc = cellSysmoduleLoadModule(CELL_SYSMODULE_NET);
+   BOOT_MARK("network module load returned\n");
+   if (netRc == 0 || (uint32_t)netRc == 0x80012001u) { // loaded, or already loaded
+      BOOT_MARK("network init begin\n");
+      netRc = sys_net_initialize_network();
+      BOOT_MARK("network init returned\n");
+   } else {
+      BOOT_MARK("network module load failed\n");
+   }
    BOOT_MARK("network\n");
    initModernHttp();   // bind the modern (BearSSL) http transport; all requests + media streams go through it
    BOOT_MARK("http\n");

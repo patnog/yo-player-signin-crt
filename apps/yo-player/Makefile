@@ -12,7 +12,7 @@ LD := $(CC)
 
 TARGET  := yo-player-psl1ght
 BUILD   := build/psl1ght
-SOURCES := src src/screens src/extractors psl1ght psl1ght/stubs
+SOURCES := src src/screens src/extractors psl1ght
 INCLUDES := include ../../libs/simple-lib-app/include ../../libs/simple-lib-av/include \
             ../../libs/simple-lib-https/include ../../libs/simple-lib-core/include psl1ght/include
 
@@ -20,8 +20,6 @@ CFILES := main.c home.c play.c search.c video-grid.c storage.c stream-select.c \
           downloads.c video-export-psl1ght.c extractor.c youtube.c sponsorblock.c \
           subtitles.c chapters.c settings.c theme.c \
           account.c account-oauth.c youtube-tv.c
-FONT_STUB_OFILES := cellfont_stub.o cellfont_libexport.o \
-                    cellfontft_stub.o cellfontft_libexport.o
 
 TITLE     := Yo! Player (PSL1GHT)
 APPID     := YOPSL0001
@@ -52,7 +50,7 @@ PROJECT_LIBDIRS := $(ROOT)/libs/simple-lib-app/build/psl1ght \
                    $(ROOT)/libs/simple-lib-core/build/psl1ght
 LIBS := -lsimple-lib-app -lsimple-lib-av -lsimple-lib-https -lsimple-lib-core \
         -lfaad -lvdec -laudio -lrsx -lgcm_sys -lio -lsysutil \
-        -lpngdec -ljpgdec -lsysmodule -lnet -lsysfs -lrt -llv2 -lm
+        -lpngdec -ljpeg -lsysmodule -lnet -lsysfs -lrt -llv2 -lm
 
 ifneq ($(notdir $(BUILD)),$(notdir $(CURDIR)))
 export OUTPUT := $(CURDIR)/$(TARGET)
@@ -62,7 +60,7 @@ export BUILDDIR := $(CURDIR)/$(BUILD)
 # sprxlinker derives each import count from the distance between consecutive
 # FNID marker symbols.  Keep every assembly marker immediately before its C
 # table object; grouping all .S files separately would make both counts zero.
-export OFILES := lv2-sprx-modern.o $(FONT_STUB_OFILES) $(CFILES:.c=.o)
+export OFILES := lv2-sprx-modern.o $(CFILES:.c=.o)
 export INCLUDE := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
                   -I$(PORTLIBS)/include $(LIBPSL1GHT_INC) -I$(CURDIR)/$(BUILD)
 export LIBPATHS := $(foreach dir,$(PROJECT_LIBDIRS),-L$(dir)) -L$(PORTLIBS)/lib $(LIBPSL1GHT_LIB)
@@ -106,12 +104,6 @@ pkg: $(BUILD)
 	@$(MAKE) --no-print-directory $(OUTPUT).pkg
 else
 DEPENDS := $(OFILES:.o=.d)
-
-# PRX import headers contain 32-bit guest pointers.  Match PSL1GHT's own
-# libexport build rule: emit the C initializer with -m32, then assemble it.
-%_libexport.o: %_libexport.c
-	@$(CC) $(DEPSOPT) -S -m32 $(INCLUDE) $< -o $(@:.o=.generated.S)
-	@$(CC) $(DEPSOPT) -c $(@:.o=.generated.S) -o $@
 
 $(OUTPUT).self: $(OUTPUT).elf
 	@echo CEX self ... $(notdir $@)

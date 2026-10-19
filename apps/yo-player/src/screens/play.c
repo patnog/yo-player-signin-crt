@@ -27,6 +27,7 @@
 
 #include "video-player.h"
 #include "audio.h"              // setAudioPcmFeedVolume
+#include "http.h"               // cancel network I/O before joining playback workers
 #include "storage.h"            // resume position (get/setWatchedPosition)
 #include "settings.h"           // sponsorblock-mode (which segment categories auto-skip)
 #include "sponsorblock.h"       // skip segments (auto-skip + seek-bar marks)
@@ -77,6 +78,7 @@ static struct {
    char             message[128];     // failure reason (worker writes, UI reads)
    VideoPlayer     *pendingPlayer;    // built by the worker, adopted by the UI thread
    volatile int     workerDone;
+   int              pauseWhenReady; // preserve Cross presses made before the first frame/player adoption
    int              threadActive;
    sys_ppu_thread_t workerTid;
    VideoPlayer     *player;
@@ -262,6 +264,7 @@ void playVideo(const char *input)
 
 static void initPlay(void)
 {
+   setHttpRequestsCancelled(0);
    memset(&state, 0, sizeof state);
    state.screenW = getGfxScreenWidth();
    state.screenH = getGfxScreenHeight();
@@ -444,8 +447,19 @@ static void handleDescriptionInput(void)
 // and title size the two columns, and the selection starts on the chapter the playhead is in.
 static void openChapters(void)
 {
-   // live streams can't seek, so a chapter jump has nowhere to go even if the description lists times
-   if (state.chapters.count == 0 || state.isLive) { showToast("No chapters"); return; }
+   // Avoid fetching YouTube's large /next response on every playback. Fetch only when the user asks
+   // for chapters; the request stays off the draw path and can be cancelled cleanly on exit.
+   if (state.isLive) { showToast("No chapters"); return; }
+   if (state.chapters.count == 0) {
+      if (!state.chFetchTried && isBareVideoId(requestedInput)) {
+         state.chFetchTried = 1;
+         state.chWorkerDone = 0;
+         state.chThreadActive = (spawnJoinableThread(&state.chWorkerTid, chapterWorker, 0,
+                                  THREAD_PRIORITY_DEFAULT, THREAD_STACK_SIZE_64KB, "yt-chapters") == 0);
+      }
+      showToast(state.chThreadActive ? "Loading chapters..." : "No chapters");
+      return;
+   }
 
    if (!state.chaptersRendered) {
       int widestTitle = 0;
@@ -495,10 +509,15 @@ static void updatePlay(void)
    // an overlay owns the pad for the whole frame it was (or just became) visible, so the button that
    // closed or opened it can't leak into playback input below (e.g. cross toggling pause on the way out)
    int overlayHadPad = state.descriptionVisible || state.chaptersVisible;
+   int loadingPauseInput = 0;
    if (state.descriptionVisible) handleDescriptionInput();
    else if (state.chaptersVisible) handleChaptersInput();
    else {
       if (isPadButtonPressed(PAD_BTN_CIRCLE)) { popScreen(); return; }   // back to the results list
+      if (state.stage == STAGE_LOADING && isPadButtonPressed(PAD_BTN_CROSS)) {
+         state.pauseWhenReady = !state.pauseWhenReady;
+         loadingPauseInput = 1;
+      }
       if (isPadButtonPressed(PAD_BTN_R3)) state.showStats = !state.showStats;
       if (isPadButtonPressed(PAD_BTN_SELECT) && state.stage == STAGE_PLAYING && state.player) openDescription();
       if (isPadButtonPressed(PAD_BTN_START) && state.stage == STAGE_PLAYING && state.player) openChapters();
@@ -512,6 +531,7 @@ static void updatePlay(void)
          state.player = state.pendingPlayer;
          state.pendingPlayer = NULL;
          setAudioPcmFeedVolume(getVolumeMeterFraction(&volumeMeter));
+         if (state.pauseWhenReady) setVideoPaused(state.player, 1);
          setLabelText(&titleLabel, state.title);   // rasterise once, off the draw path
          state.stage = STAGE_PLAYING;
       }
@@ -524,13 +544,7 @@ static void updatePlay(void)
       state.sbReady = 1;
    }
 
-   // chapters: when the description parse found none, ask /next once for youtube's own list
-   if (state.stage == STAGE_PLAYING && !state.chFetchTried && state.chapters.count == 0 && !state.isLive &&
-       isBareVideoId(requestedInput)) {
-      state.chFetchTried = 1;
-      state.chThreadActive = (spawnJoinableThread(&state.chWorkerTid, chapterWorker, 0,
-                              THREAD_PRIORITY_DEFAULT, THREAD_STACK_SIZE_64KB, "yt-chapters") == 0);
-   }
+   // Chapter fetching is on demand from openChapters(), avoiding an unnecessary API request at startup.
    if (state.chWorkerDone && state.chThreadActive) {
       joinThread(state.chWorkerTid);
       state.chThreadActive = 0;
@@ -568,7 +582,8 @@ static void updatePlay(void)
    if (state.subtitlesReady && state.subtitlePick >= 0 && state.stage == STAGE_PLAYING && state.player)
       setLabelText(&subtitleLabel, getSubtitleCueText(state.subtitleTrack, getVideoPositionSeconds(state.player), &state.subtitleScanFrom));
 
-   if (state.stage == STAGE_PLAYING && state.player && !overlayHadPad && !state.descriptionVisible && !state.chaptersVisible)
+   if (state.stage == STAGE_PLAYING && state.player && !overlayHadPad && !loadingPauseInput &&
+       !state.descriptionVisible && !state.chaptersVisible)
       handlePlaybackInput();
    if (state.sbReady && state.stage == STAGE_PLAYING && state.player && !isVideoPaused(state.player) && !state.seeking)
       autoSkipSponsor();
@@ -789,6 +804,9 @@ static void drawPlay(void)
 
 static void termPlay(void)
 {
+   // Wake worker threads blocked in TLS connect/read before joining them. Without this, leaving during
+   // a slow YouTube resolve can make the screen manager wait through several 10-second socket timeouts.
+   setHttpRequestsCancelled(1);
    if (state.threadActive) { joinThread(state.workerTid); state.threadActive = 0; }
    if (state.sbThreadActive) { joinThread(state.sbWorkerTid); state.sbThreadActive = 0; }   // usually already done
    if (state.subThreadActive) { joinThread(state.subWorkerTid); state.subThreadActive = 0; }
@@ -815,6 +833,7 @@ static void termPlay(void)
    freeVolumeMeter(&volumeMeter);
    freeTextTexture(&descriptionTexture);
    closeFont(&uiFont);
+   setHttpRequestsCancelled(0);
 }
 
 Screen playScreen = { initPlay, NULL, updatePlay, drawPlay, NULL, termPlay, SCREEN_TERMINATED };

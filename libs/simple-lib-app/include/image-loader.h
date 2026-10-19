@@ -37,6 +37,14 @@ typedef struct {
 // one's result is discarded when it finishes). Lazily starts the worker.
 void requestImageAsync(const char *path);
 
+// Requests an async decode of an in-memory PNG/JPEG buffer. The input is copied, so the caller may
+// release or reuse its source immediately. Returns 0 when queued, -1 on allocation/worker failure.
+int requestImageMemAsync(const void *data, uint32_t size);
+
+// Invalidates the current request/result. A codec call already in progress is allowed to finish, then
+// its result is discarded.
+void cancelImageAsync(void);
+
 // Polls the most recent request. Returns 1 and fills out (caller then owns
 // out->pixels) when it finished decoding; 0 while still decoding; -1 once if it
 // failed. Results from superseded requests are never reported.

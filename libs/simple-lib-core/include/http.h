@@ -54,3 +54,4 @@ int  isHttpUrl(const char *path);   // true for an http:// or https:// url
 void initSystemHttp(void);          // register the cellHttp transport (simple-lib-core)
 void initModernHttp(void);          // register the BearSSL transport (simple-lib-https); overrides system
 void shutdownHttp(void);            // release the transport's idle pooled connections (call at app exit)
+void setHttpRequestsCancelled(int cancelled); // interrupt active requests while a screen's workers stop

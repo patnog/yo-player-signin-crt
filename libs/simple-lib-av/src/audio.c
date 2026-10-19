@@ -412,9 +412,10 @@ int initAudio(void) {
    streamCount = 0;
    memset(streams, 0, sizeof(streams));
 
-   // 64KB stack: the mixer decodes ogg and converts wav PCM in per-block buffers on this thread.
+   // Keep the PCM mixer above VDEC under high-resolution playback; this avoids audio underruns
+   // while the decoder's PPU/SPU priorities are raised to sustain high-frame-rate video.
    sys_ppu_thread_create(&audioThread, audioMixerThread, 0,
-                         THREAD_PRIORITY_HIGH, THREAD_STACK_SIZE_64KB,
+                         150, THREAD_STACK_SIZE_64KB,
                          SYS_PPU_THREAD_CREATE_JOINABLE, "audio-mixer");
    return 0;
 }

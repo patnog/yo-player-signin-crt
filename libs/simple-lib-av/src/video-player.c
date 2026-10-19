@@ -21,6 +21,7 @@
 // decoder banks during easy scenes and spends on hard (high-bitrate) frames without the picture stalling.
 #define FRAME_SLOTS           8
 #define PREROLL_FRAMES        4      // frames buffered before the first present (start latency, not ring depth)
+#define AUDIO_STARTUP_PRIME_FRAMES 2048 // two typical AAC frames; avoids the old ~0.37 s audio lead-in
 #define PREROLL_AUDIO_TIMEOUT_US (5 * 1000 * 1000)   // give up waiting for audio to anchor the clock, play video alone
 #define DECODE_STALL_MS       3000   // no AU consumed and no picture produced for this long = hard error
 #define END_OF_STREAM_DRAIN_MS 500   // how long to wait for the last pictures after the final AU
@@ -87,6 +88,26 @@ struct VideoPlayer {
    int      displayIndex;         // slot being displayed, or -1
    uint64_t audioWaitStartUs;     // when pre-roll first started waiting on the audio clock (0 = not yet)
 };
+
+// Keep the decoder's input rate within its measured throughput: 1080p60 is over twice the
+// sustainable decode load, while 720p60 remains below it. The gated skip mode only drops
+// non-reference pictures on alternate AUs, preserving the H.264 reference chain.
+static int shouldAlternateSkipForStream(const VideoPlayer *player)
+{
+   if (!player->demuxer.frameDurationNs || player->allocW <= 0 || player->allocH <= 0) return 0;
+   uint64_t fps = 1000000000ull / player->demuxer.frameDurationNs;
+   uint64_t pixelsPerSecond = (uint64_t)player->allocW * (uint64_t)player->allocH * fps;
+   return fps > 31 && pixelsPerSecond >= 75000000ull;
+}
+
+static void configureDecoderForStream(VideoPlayer *player)
+{
+   int enabled = shouldAlternateSkipForStream(player);
+   setH264DecoderAlternateSkip(player->decoder, enabled);
+   if (enabled)
+      logWarn("[video-player] %llu fps at %dx%d exceeds decode throughput; alternating non-reference skip to preserve sync\n",
+              1000000000ull / player->demuxer.frameDurationNs, player->demuxer.width, player->demuxer.height);
+}
 
 // defined below the decode thread but used by performSeek's audio-revive path
 static VideoDemuxer *getAudioSource(VideoPlayer *player);
@@ -167,6 +188,7 @@ static void performSeek(VideoPlayer *player)
       logWarn("[video-player] decoder reset failed, recreating decoder\n");
       destroyH264Decoder(player->decoder);
       player->decoder = createH264Decoder(player->allocW, player->allocH, player->demuxer.level, player->demuxer.h264.maxRefFrames);
+      if (player->decoder) configureDecoderForStream(player);
    }
    player->hasPendingAu = 0;
    // land on the fragment keyframe covering the target - or, for a sponsor skip, the next keyframe at/after it
@@ -366,7 +388,7 @@ static void startAudioPipeline(VideoPlayer *player)
    player->adtsBuffers[0] = (uint8_t *)malloc(ADTS_HEADER_BYTES + AUDIO_AU_MAX_BYTES);
    player->adtsBuffers[1] = (uint8_t *)malloc(ADTS_HEADER_BYTES + AUDIO_AU_MAX_BYTES);
    player->pcmScratch = (float *)malloc(AAC_MAX_FRAME_SAMPLES * 2 * sizeof(float));
-   player->audioFeedOpen = openAudioPcmFeed(source->audioRate, 0) == 0;   // 0 = the default file-playback backlog
+   player->audioFeedOpen = openAudioPcmFeed(source->audioRate, AUDIO_STARTUP_PRIME_FRAMES) == 0;
 
    if (!player->aacDecoder || !player->adtsBuffers[0] || !player->adtsBuffers[1] || !player->pcmScratch || !player->audioFeedOpen) goto silent;
 
@@ -459,13 +481,7 @@ VideoPlayer *createVideoPlayerSplit(const char *videoPath, const char *audioPath
    }
    player->decoder = createH264Decoder(player->allocW, player->allocH, player->demuxer.level, player->demuxer.h264.maxRefFrames);
    if (!player->decoder) goto fail;
-
-   // 1080p decode tops out around 35fps on the SPUs; faster streams (e.g. 1080p50 broadcasts) play
-   // best-effort at that rate. (B_SKIP was tried and dropped: these encodes are ~87% disposable
-   // B-frames, so skipping them leaves a ~7fps slideshow.)
-   if (player->demuxer.frameDurationNs && player->demuxer.frameDurationNs < 32000000ull)
-      logWarn("[video-player] %d fps exceeds decoder throughput, playback will drop frames\n",
-              (int)(1000000000ull / player->demuxer.frameDurationNs));
+   configureDecoderForStream(player);
 
    // YUV 4:2:0 planar frames; cellVdecGetPicture requires 128-byte alignment, size a multiple of 128
    size_t frameBytes = ((size_t)player->allocW * player->allocH * 3 / 2 + 127) & ~(size_t)127;
@@ -529,6 +545,7 @@ const uint8_t *getVideoFrame(VideoPlayer *player, int *width, int *height)
 {
    uint64_t nowUs = sys_time_get_system_time();
    int releaseAudio = 0;   // set when pre-roll fires, to un-hold the audio feed after the lock is dropped
+   int releaseAudioPaused = 0;
    lock(&player->lock);
 
    // a posted seek freezes presentation: frames decoded before the flush must not advance the
@@ -561,6 +578,7 @@ const uint8_t *getVideoFrame(VideoPlayer *player, int *width, int *height)
       player->baseWallUs = nowUs;
       player->started    = 1;
       releaseAudio       = 1;   // start the audio feed together with the first video frame
+      releaseAudioPaused = player->paused;
    }
 
    // the audio clock is the sync master while audio runs: it only advances as samples reach the
@@ -573,10 +591,10 @@ const uint8_t *getVideoFrame(VideoPlayer *player, int *width, int *height)
    }
 
    uint64_t clock;
-   if (player->audioClockValid && player->started)
-      clock = player->audioClockBasePts + getAudioPcmFeedPlayedFrames() * 1000000000ull / (uint64_t)getAudioSource(player)->audioRate;
-   else if (player->paused)
+   if (player->paused)
       clock = player->currentPts;
+   else if (player->audioClockValid && player->started)
+      clock = player->audioClockBasePts + getAudioPcmFeedPlayedFrames() * 1000000000ull / (uint64_t)getAudioSource(player)->audioRate;
    else
       clock = player->basePts + (nowUs - player->baseWallUs) * 1000;   // us -> ns
 
@@ -602,7 +620,7 @@ const uint8_t *getVideoFrame(VideoPlayer *player, int *width, int *height)
    unlock(&player->lock);
 
    // release the audio held through pre-roll (mixer call must run outside player->lock)
-   if (releaseAudio && player->audioFeedOpen) pauseAudioPcmFeed(0);
+   if (releaseAudio && player->audioFeedOpen) pauseAudioPcmFeed(releaseAudioPaused);
    return buffer;
 }
 

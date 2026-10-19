@@ -1,13 +1,13 @@
 // youtube extractor - InnerTube player request + parse.
 //
-// POSTs the player endpoint as the ANDROID_VR (Oculus) client, which returns
+// POSTs the player endpoint as the VISIONOS (Apple Vision Pro) client, which returns
 // direct (unciphered) urls and - unlike plain ANDROID/WEB - is not behind the
 // GVS PoToken wall, so its adaptive (fragmented) urls above 360p don't 403.
 // Those streams are fragmented mp4 (moof); the demuxer handles them.
 //
-// Fragile by nature: Google keeps closing these token-exempt clients (VR must be
-// pinned to 1.65.10 - newer builds hand back SABR-only streams). The durable fix
-// is a multi-client fallback chain (VR -> ANDROID itag 18 -> ...) layered here.
+// Fragile by nature: Google keeps closing these token-exempt clients. ANDROID_VR
+// (Oculus) was capped to ~60 seconds of media on 2026-08-26; VISIONOS replaced it
+// and serves full-length urls. Expect this to need swapping again in future.
 
 #include "extractor.h"
 #include "http.h"               // fetchHttp
@@ -28,41 +28,54 @@
 #define RESP_CAP   (2 * 1024 * 1024)   // player JSON can pass 1 MB; a truncated response loses formats (and their urls)
 
 // two clients, each for what it does best:
-//  - ANDROID_VR (playback), see below. WEB/plain ANDROID are PoToken-gated for
+//  - VISIONOS (playback), see below. WEB/plain ANDROID are PoToken-gated for
 //    adaptive (their googlevideo urls 403 above 360p - only progressive itag 18
 //    is token-exempt); TVHTML5 hit the bot wall; iOS gave only fragmented adaptive.
-//  - ANDROID_VR (Oculus) is currently exempt from the GVS PO-token wall and
-//    returns direct (un-ciphered) adaptive urls, so it plays above 360p. Pin the
-//    version to 1.65.10 - newer VR builds hand back SABR-only streams we can't
-//    read. Erratic on some videos, so ANDROID itag 18 stays the 360p fallback.
+//  - VISIONOS (Apple Vision Pro) is currently exempt from the GVS PO-token wall and
+//    returns direct (un-ciphered) adaptive urls that serve full-length, so it plays
+//    above 360p past the ~60s cap that now hits ANDROID_VR (the client it replaced).
 //  - WEB (search): search isn't PoToken-gated, and WEB reliably returns the
 //    videoRenderer result structure we parse.
-#define VR_VERSION  "1.65.10"
-#define WEB_VERSION "2.20250701.00.00"
+#define PLAYER_VERSION "1.02"
+#define WEB_VERSION    "2.20250701.00.00"
 
 // visitor session endpoint: mints an anonymous visitorData that clears the
 // logged-out LOGIN_REQUIRED ("confirm you're not a bot") wall (see extract()).
 // the key below is youtube's own public web key, shipped in every youtube.com page. not a credential.
 #define VISITOR_URL "https://www.youtube.com/youtubei/v1/visitor_id?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false"
 
-// the ANDROID_VR client object, without the wrapping braces so visitorData can
+// the VISIONOS client object, without the wrapping braces so visitorData can
 // be appended before the player request closes it.
-#define VR_CLIENT \
-   "\"clientName\":\"ANDROID_VR\",\"clientVersion\":\"" VR_VERSION "\"," \
-   "\"deviceMake\":\"Oculus\",\"deviceModel\":\"Quest 3\",\"androidSdkVersion\":32," \
-   "\"osName\":\"Android\",\"osVersion\":\"12L\",\"hl\":\"en\",\"gl\":\"US\"," \
-   "\"timeZone\":\"UTC\",\"utcOffsetMinutes\":0"
+#define PLAYER_CLIENT \
+   "\"clientName\":\"VISIONOS\",\"clientVersion\":\"" PLAYER_VERSION "\"," \
+   "\"deviceMake\":\"Apple\",\"deviceModel\":\"RealityDevice17,1\"," \
+   "\"osName\":\"visionOS\",\"osVersion\":\"26.5.23O471\",\"hl\":\"en\",\"gl\":\"US\""
 #define WEB_CONTEXT \
    "{\"context\":{\"client\":{\"clientName\":\"WEB\",\"clientVersion\":\"" WEB_VERSION "\",\"hl\":\"en\",\"gl\":\"US\"}}"
 
-static const char *VR_UA =
-   "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+static const char *PLAYER_UA =
+   "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 static const char *WEB_UA =
    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
-// player body: VR client + the minted visitorData, then the video id. two %s: visitorData, videoId.
+// player body: the client + the minted visitorData, then the video id. two %s: visitorData, videoId.
 static const char *PLAYER_BODY_FMT =
-   "{\"context\":{\"client\":{" VR_CLIENT ",\"visitorData\":\"%s\"}},\"videoId\":\"%s\",\"contentCheckOk\":true,\"racyCheckOk\":true}";
+   "{\"context\":{\"client\":{" PLAYER_CLIENT ",\"visitorData\":\"%s\"}},\"videoId\":\"%s\",\"contentCheckOk\":true,\"racyCheckOk\":true}";
+
+// live streams need the ANDROID_VR client: VISIONOS returns only an HLS manifest for them, which the live
+// path can't read, while ANDROID_VR still returns the DASH manifest it needs. Live fetches discrete
+// segments, so the ~60s cap that pushed VOD off ANDROID_VR does not apply here.
+#define LIVE_VERSION "1.65.10"
+#define LIVE_CLIENT \
+   "\"clientName\":\"ANDROID_VR\",\"clientVersion\":\"" LIVE_VERSION "\"," \
+   "\"deviceMake\":\"Oculus\",\"deviceModel\":\"Quest 3\",\"androidSdkVersion\":32," \
+   "\"osName\":\"Android\",\"osVersion\":\"12L\",\"hl\":\"en\",\"gl\":\"US\"," \
+   "\"timeZone\":\"UTC\",\"utcOffsetMinutes\":0"
+static const char *LIVE_UA =
+   "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+static const char *LIVE_BODY_FMT =
+   "{\"context\":{\"client\":{" LIVE_CLIENT ",\"visitorData\":\"%s\"}},\"videoId\":\"%s\",\"contentCheckOk\":true,\"racyCheckOk\":true}";
+
 static const char *VISITOR_BODY   = WEB_CONTEXT "}";   // WEB_CONTEXT leaves the root object open; close it
 // search params combine the "Videos" filter (drops the Shorts shelf, channels and playlists) with a sort
 // order. index by SortOrder. canonical values from youtube's own filter menu. two %s: escaped query, params.
@@ -346,7 +359,7 @@ static void parseLiveManifest(const char *resp, const char *end, StreamInfo *out
    int cap = 4 * 1024 * 1024;   // live DVR manifests enumerate every segment and can pass 1 MB
    char *mpd = (char *)malloc(cap);
    if (!mpd) return;
-   HttpHeader headers[] = { { "User-Agent", VR_UA }, { "Accept-Encoding", "identity" } };
+   HttpHeader headers[] = { { "User-Agent", PLAYER_UA }, { "Accept-Encoding", "identity" } };
    int length = 0, status = 0;
    if (fetchHttp("GET", manifestUrl, headers, 2, NULL, 0, mpd, cap, &length, &status) != 0 || status != 200) {
       logError("[yt] live manifest fetch status=%d len=%d\n", status, length);
@@ -390,6 +403,28 @@ static void parseLiveManifest(const char *resp, const char *end, StreamInfo *out
    free(mpd);
 }
 
+// POST the player endpoint with one client identity, into resp. 0 on a 200 with a body, else negative.
+static int fetchPlayer(const char *bodyFmt, const char *userAgent, const char *clientName,
+                       const char *clientVersion, const char *videoId, char *resp, int *respLen)
+{
+   char body[1024];
+   int bodyLen = snprintf(body, sizeof body, bodyFmt, visitorData, videoId);
+   HttpHeader headers[] = {
+      { "Content-Type", "application/json" },
+      { "User-Agent", userAgent },
+      { "X-YouTube-Client-Name", clientName },
+      { "X-YouTube-Client-Version", clientVersion },
+      { "X-Goog-Visitor-Id", visitorData },
+      { "Origin", "https://www.youtube.com" },
+      { "Accept-Encoding", "identity" },
+   };
+   int status = 0;
+   int rc = fetchHttp("POST", PLAYER_URL, headers, 7, body, bodyLen, resp, RESP_CAP, respLen, &status);
+   if (rc < 0)        { logError("[yt] player POST failed rc=%d\n", rc); return rc; }
+   if (status != 200) { logError("[yt] player POST status=%d respLen=%d\n", status, *respLen); return -status; }
+   return 0;
+}
+
 static int extract(const char *input, StreamInfo *out)
 {
    memset(out, 0, sizeof *out);
@@ -398,49 +433,38 @@ static int extract(const char *input, StreamInfo *out)
    if (!extractVideoId(input, videoId, sizeof videoId)) return -1;
    if (ensureVisitorData() != 0) return -1;
 
-   char body[1024];
-   int bodyLen = snprintf(body, sizeof body, PLAYER_BODY_FMT, visitorData, videoId);
-
-   HttpHeader headers[] = {
-      { "Content-Type", "application/json" },
-      { "User-Agent", VR_UA },
-      { "X-YouTube-Client-Name", "28" },
-      { "X-YouTube-Client-Version", VR_VERSION },
-      { "X-Goog-Visitor-Id", visitorData },
-      { "Origin", "https://www.youtube.com" },
-      { "Accept-Encoding", "identity" },
-   };
-
    char *resp = malloc(RESP_CAP);
    if (!resp) return -1;
 
-   int respLen = 0, status = 0;
-   int rc = fetchHttp("POST", PLAYER_URL, headers, 7, body, bodyLen, resp, RESP_CAP, &respLen, &status);
-   if (rc < 0)        { logError("[yt] player POST failed rc=%d\n", rc); free(resp); return rc; }
-   if (status != 200) { logError("[yt] player POST status=%d respLen=%d\n", status, respLen); free(resp); return -status; }
+   int respLen = 0;
+   int rc = fetchPlayer(PLAYER_BODY_FMT, PLAYER_UA, "101", PLAYER_VERSION, videoId, resp, &respLen);
+   if (rc != 0) { free(resp); return rc; }
    const char *end = resp + respLen;
 
-   // metadata
+   // metadata, copied into out so it survives a live re-fetch overwriting resp below
    const char *details = strstr(resp, "\"videoDetails\"");
    jsonString(details ? details : resp, end, "title", out->title, sizeof out->title);
    jsonString(details ? details : resp, end, "shortDescription", out->description, sizeof out->description);
    char lenText[16];
    if (jsonString(details ? details : resp, end, "lengthSeconds", lenText, sizeof lenText))
       out->durationSeconds = atoi(lenText);
-
    parseCaptionTracks(resp, end, out);
-   parseFormats(resp, end, out);
 
-   // a currently-live stream (isLive:true) is a rolling DVR window, so the init/moov at byte 0 may have
-   // rolled off - it needs the DASH manifest's explicit init + segment template rather than a static open.
-   {
-      int liveNow      = strstr(resp, "\"isLive\":true") != NULL;
-      const char *dash = strstr(resp, "\"dashManifestUrl\"");
-      out->isLive = liveNow;
-      if (liveNow) {
-         logInfo("[yt] live stream (dash=%d formats=%d dur=%d)\n", dash ? 1 : 0, out->formatCount, out->durationSeconds);
-         parseLiveManifest(resp, end, out);
-      }
+   // a live stream (isLive:true) is a rolling DVR window played from the DASH manifest's segment template.
+   // VISIONOS only returns an HLS manifest for live, so re-resolve with ANDROID_VR for the DASH one before
+   // parsing formats.
+   int liveNow = strstr(resp, "\"isLive\":true") != NULL;
+   if (liveNow && !strstr(resp, "\"dashManifestUrl\"")) {
+      if (fetchPlayer(LIVE_BODY_FMT, LIVE_UA, "28", LIVE_VERSION, videoId, resp, &respLen) == 0)
+         end = resp + respLen;
+   }
+
+   parseFormats(resp, end, out);
+   out->isLive = liveNow;
+   if (liveNow) {
+      logInfo("[yt] live stream (dash=%d formats=%d dur=%d)\n",
+              strstr(resp, "\"dashManifestUrl\"") ? 1 : 0, out->formatCount, out->durationSeconds);
+      parseLiveManifest(resp, end, out);
    }
 
    if (out->formatCount == 0) {

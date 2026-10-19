@@ -32,6 +32,7 @@ void bindTlsChannel(const TlsChannel *channel);
 // (from the transport's init) before any connection is opened. not used by a bound channel, which
 // looks names up itself.
 void initTlsResolver(void);
+void setTlsRequestsCancelled(int cancelled); // interrupt active sockets and gate new TLS connections
 
 // resolve host and run a full TLS 1.2 client handshake (cert + hostname validated against the bundled
 // roots, SNI set) to host:443. returns the connection, or NULL on resolve/connect/handshake failure.

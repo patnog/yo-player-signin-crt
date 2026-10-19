@@ -21,13 +21,13 @@
 #include <string.h>
 #include <stdio.h>
 
-#define MARGIN_X      50
-#define HEADER_Y      26
-#define TITLE_SIZE    26
-#define GRID_TOP      74
-#define HINTS_BOTTOM  42
-#define HINT_GLYPH_H  22
-#define HINT_TEXT     18
+#define MARGIN_X      80
+#define HEADER_Y      54
+#define TITLE_SIZE    30
+#define GRID_TOP      100
+#define HINTS_BOTTOM  88
+#define HINT_GLYPH_H  28
+#define HINT_TEXT     22
 #define TRIANGLE_HINT 3         // Triangle's slot in the hint row (see initSearch): retitled per mode
 
 static const char *SortNames[SORT_COUNT]                = { "Relevance", "Views" };
@@ -147,7 +147,7 @@ static void initSearch(void)
    addButtonHint(&hints, getConsoleGlyph(GLYPH_R3),       "Download");
    addButtonHint(&hints, getConsoleGlyph(GLYPH_START),    "Search");
 
-   initVideoGrid(&search.grid, &uiFont, MARGIN_X, GRID_TOP, search.screenW - 2 * MARGIN_X, search.screenH - GRID_TOP);
+   initVideoGrid(&search.grid, &uiFont, MARGIN_X, GRID_TOP, search.screenW - 2 * MARGIN_X, search.screenH - GRID_TOP - HINTS_BOTTOM - HINT_GLYPH_H - 24);
    setGridWatchedPredicate(&search.grid, isWatched);
    setGridWatchLaterPredicate(&search.grid, isWatchLater);
    reload();

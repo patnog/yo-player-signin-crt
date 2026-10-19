@@ -49,27 +49,78 @@ struct TlsConn {
 // threads (the thumbnail fetchers) open connections at once. Created once by initTlsResolver at startup.
 static sys_lwmutex_t resolveLock;
 static int           resolveLockReady;
-void initTlsResolver(void)  { if (!resolveLockReady) { createLock(&resolveLock); resolveLockReady = 1; } }
+static sys_lwmutex_t socketLock;
+static int           socketLockReady;
+static volatile int  requestsCancelled;
+#define ACTIVE_SOCKET_MAX 64
+static int activeSockets[ACTIVE_SOCKET_MAX];
+static int activeSocketCount;
+
+void initTlsResolver(void)
+{
+   if (!resolveLockReady) { createLock(&resolveLock); resolveLockReady = 1; }
+   if (!socketLockReady) { createLock(&socketLock); socketLockReady = 1; }
+}
+
 static void lockResolve(void)   { if (resolveLockReady) lock(&resolveLock); }
 static void unlockResolve(void) { if (resolveLockReady) unlock(&resolveLock); }
 
+static int registerSocket(int handle)
+{
+   if (!socketLockReady) return 0;
+   lock(&socketLock);
+   int accepted = !requestsCancelled && activeSocketCount < ACTIVE_SOCKET_MAX;
+   if (accepted) activeSockets[activeSocketCount++] = handle;
+   unlock(&socketLock);
+   return accepted;
+}
+
+static void unregisterSocket(int handle)
+{
+   if (!socketLockReady) return;
+   lock(&socketLock);
+   for (int i = 0; i < activeSocketCount; i++) {
+      if (activeSockets[i] != handle) continue;
+      activeSockets[i] = activeSockets[--activeSocketCount];
+      break;
+   }
+   unlock(&socketLock);
+}
+
+void setTlsRequestsCancelled(int cancelled)
+{
+   if (!socketLockReady) { requestsCancelled = cancelled != 0; return; }
+   lock(&socketLock);
+   requestsCancelled = cancelled != 0;
+   if (requestsCancelled)
+      for (int i = 0; i < activeSocketCount; i++) shutdown(activeSockets[i], SHUT_RDWR);
+   unlock(&socketLock);
+}
+
 static int readSocket(int handle, void *buffer, int length)
 {
+   if (requestsCancelled) return -1;
    int got = recv(handle, buffer, length, 0);
    return got <= 0 ? -1 : got;
 }
 
 static int writeSocket(int handle, const void *data, int length)
 {
+   if (requestsCancelled) return -1;
    int sent = send(handle, data, length, 0);
    return sent <= 0 ? -1 : sent;
 }
 
-static void closeSocket(int handle) { socketclose(handle); }
+static void closeSocket(int handle)
+{
+   unregisterSocket(handle);
+   socketclose(handle);
+}
 
 // resolve host and open a TCP connection to port 443. returns the socket, or -1.
 static int connectHost(const char *host, int port)
 {
+   if (requestsCancelled) return -1;
    struct sockaddr_in address;
    memset(&address, 0, sizeof address);
    address.sin_family = AF_INET;
@@ -83,17 +134,19 @@ static int connectHost(const char *host, int port)
    if (resolvedOk) memcpy(&address.sin_addr, resolved->h_addr_list[0], sizeof address.sin_addr);
    unlockResolve();
    if (!resolvedOk) { logError("[tls] dns failed for %s\n", host); return -1; }
+   if (requestsCancelled) return -1;
 
    int socketHandle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
    if (socketHandle < 0) { logError("[tls] socket() failed\n"); return -1; }
+   if (!registerSocket(socketHandle)) { socketclose(socketHandle); return -1; }
 
    struct timeval timeout = { SOCKET_TIMEOUT, 0 };
    setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
    setsockopt(socketHandle, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
 
    if (connect(socketHandle, (struct sockaddr *)&address, sizeof address) < 0) {
-      logError("[tls] connect failed to %s\n", host);
-      socketclose(socketHandle);
+      if (!requestsCancelled) logError("[tls] connect failed to %s\n", host);
+      closeSocket(socketHandle);
       return -1;
    }
    return socketHandle;

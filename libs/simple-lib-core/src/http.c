@@ -30,6 +30,12 @@ void shutdownHttp(void)
    if (transport && transport->shutdown) transport->shutdown();
 }
 
+void setHttpRequestsCancelled(int cancelled)
+{
+   if (transport && transport->setRequestsCancelled)
+      transport->setRequestsCancelled(cancelled != 0);
+}
+
 int isHttpUrl(const char *path)
 {
    return strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0;

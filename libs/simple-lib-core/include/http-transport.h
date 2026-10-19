@@ -32,6 +32,10 @@ typedef struct {
    // copy one named response header (case-insensitive) of the open request into out. 0 when found,
    // -1 when absent. optional - may be NULL on a transport that doesn't keep the response head.
    int (*getResponseHeader)(void *handle, const char *name, char *out, int cap);
+
+   // interrupt current requests and reject new ones until cleared. optional - used when a screen
+   // leaves while its worker threads are blocked in network I/O.
+   void (*setRequestsCancelled)(int cancelled);
 } HttpTransport;
 
 // wire a transport into http.c. an `override` bind claims the slot permanently (modern wins over system

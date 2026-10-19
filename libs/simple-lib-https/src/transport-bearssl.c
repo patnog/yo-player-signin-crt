@@ -168,7 +168,14 @@ static int getHeaderBearssl(void *handle, const char *name, char *out, int cap)
    return getTlsHeader((TlsConn *)handle, name, out, cap);
 }
 
-static const HttpTransport BEARSSL_TRANSPORT = { openBearssl, readBearssl, closeBearssl, shutdownBearssl, getHeaderBearssl };
+static void setRequestsCancelledBearssl(int cancelled)
+{
+   setTlsRequestsCancelled(cancelled);
+}
+
+static const HttpTransport BEARSSL_TRANSPORT = {
+   openBearssl, readBearssl, closeBearssl, shutdownBearssl, getHeaderBearssl, setRequestsCancelledBearssl
+};
 
 void initModernHttp(void)
 {

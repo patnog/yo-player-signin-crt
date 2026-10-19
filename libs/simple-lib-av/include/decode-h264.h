@@ -21,6 +21,11 @@ typedef struct H264Decoder H264Decoder;
 // buffers (+1) so high-reference streams don't overflow the level's default pool. NULL on failure.
 H264Decoder *createH264Decoder(int width, int height, int level, int maxRefFrames);
 
+// For high pixel-rate streams, alternate normal and skip-non-reference decoding on successive
+// access units. This keeps media time moving on the PS3's ~35 fps 1080p decoder; it does not
+// produce 60 decoded pictures per second. Set before feeding begins.
+void setH264DecoderAlternateSkip(H264Decoder *decoder, int enabled);
+
 // feeds one Annex-B access unit without waiting for it to be consumed. pts is opaque (passed through
 // to the decoded picture). returns 0 when fed, 1 when the decoder's queues are full (pull pictures
 // with getFrameH264, then retry the same AU), -1 on error. `data` must stay untouched until the

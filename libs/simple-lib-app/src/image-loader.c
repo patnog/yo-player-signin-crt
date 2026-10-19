@@ -17,14 +17,17 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <setjmp.h>
+#include <jpeglib.h>
 #include <cell/codec/pngdec.h>
-#include <cell/codec/jpgdec.h>
 
 // The RSX cannot sample a 2D texture larger than 4096x4096 -- handing it an
 // oversized texture corrupts the display and hangs the GPU. So we never produce
 // a buffer bigger than this: JPEG is downscaled by the codec, PNG (no codec
 // downscale) is rejected when it exceeds the limit.
 #define MAX_TEX_DIM 4096
+#define MAX_DECODE_PIXELS (4u * 1024u * 1024u)
 
 // ---------------------------------------------------------------------------
 // format check + directory listing
@@ -55,12 +58,10 @@ static void *imgMalloc(uint32_t size, void *arg) { (void)arg; return malloc(size
 static void imgFree(void *ptr, void *arg)        { (void)arg; free(ptr); }
 #define IMAGE_DECODE_STATUS(value) ((value).decode_status)
 #define PNG_OUTPUT_WIDTH_BYTES(value) ((value).width_byte)
-#define JPG_OUTPUT_WIDTH_BYTES(value) ((value).width_bytes)
 #else
 static int32_t imgFree(void *ptr, void *arg)     { (void)arg; free(ptr); return 0; }
 #define IMAGE_DECODE_STATUS(value) ((value).status)
 #define PNG_OUTPUT_WIDTH_BYTES(value) ((value).outputWidthByte)
-#define JPG_OUTPUT_WIDTH_BYTES(value) ((value).outputWidthByte)
 #endif
 
 // Fill a PNG source descriptor for an in-memory buffer. We always decode from
@@ -147,92 +148,130 @@ static int decodePng(const CellPngDecSrc *src, ImageBuffer *out)
    return 0;
 }
 
-// Fill a JPEG source descriptor for an in-memory buffer (see pngSrcMem).
-static void jpgSrcMem(CellJpgDecSrc *s, const void *buf, uint32_t size)
+// libjpeg's fatal-error callback normally terminates the process. Convert those
+// errors to a local failure so a corrupt remote thumbnail cannot kill the app.
+typedef struct {
+   struct jpeg_error_mgr base;
+   jmp_buf jump;
+} JpegErrorState;
+
+typedef struct {
+   struct jpeg_decompress_struct decoder;
+   JpegErrorState error;
+   uint8_t *pixels;
+   JSAMPLE *row;
+} JpegDecodeState;
+
+static void jpegDecodeError(j_common_ptr common)
 {
-   s->srcSelect = CELL_JPGDEC_BUFFER; s->fileName = NULL;
-   s->fileOffset = 0; s->fileSize = 0; s->streamPtr = (void *)buf; s->streamSize = size;
-   s->spuThreadEnable = CELL_JPGDEC_SPU_THREAD_DISABLE;
+   JpegErrorState *error = (JpegErrorState *)common->err;
+   longjmp(error->jump, 1);
 }
 
-// decodes a JPEG from a prepared source into a freshly malloc'd ARGB8888 buffer. returns 0 ok.
-static int decodeJpeg(const CellJpgDecSrc *src, ImageBuffer *out)
+// Decode JPEG in software. The Sony JPGDEC module's create call can block on
+// this console when invoked from a worker, so JPEG thumbnails must not depend
+// on it. This decoder owns only heap buffers and never touches RSX state.
+static int decodeJpeg(const void *data, uint32_t size, ImageBuffer *out)
 {
-   CellJpgDecMainHandle mainHandle;
-   CellJpgDecSubHandle  subHandle;
-   CellJpgDecThreadInParam  threadIn;
-   CellJpgDecThreadOutParam threadOut;
-   CellJpgDecOpnInfo    openInfo;
-   CellJpgDecInfo       info;
-   CellJpgDecInParam    inParam;
-   CellJpgDecOutParam   outParam;
-   CellJpgDecDataCtrlParam ctrl;
-   CellJpgDecDataOutInfo   dataInfo;
-   int ret;
+   JpegDecodeState *state;
+   struct jpeg_decompress_struct *cinfo;
+   volatile uint32_t scale = 1;
+   uint64_t scaledW, scaledH, pixelCount, pitch;
 
-   threadIn.spuThreadEnable   = CELL_JPGDEC_SPU_THREAD_DISABLE;
-   threadIn.ppuThreadPriority = 512;
-   threadIn.spuThreadPriority = 200;
-   threadIn.cbCtrlMallocFunc  = imgMalloc;
-   threadIn.cbCtrlMallocArg   = NULL;
-   threadIn.cbCtrlFreeFunc    = imgFree;
-   threadIn.cbCtrlFreeArg     = NULL;
+   if (!out) return -1;
+   out->pixels = NULL;
+   out->w = out->h = out->pitch = 0;
+   if (!data || size == 0) return -1;
 
-   ret = cellJpgDecCreate(&mainHandle, &threadIn, &threadOut);
-   if (ret != CELL_OK) return -1;
+   state = (JpegDecodeState *)calloc(1, sizeof(*state));
+   if (!state) return -1;
+   cinfo = &state->decoder;
+   cinfo->err = jpeg_std_error(&state->error.base);
+   state->error.base.error_exit = jpegDecodeError;
 
-   ret = cellJpgDecOpen(mainHandle, &subHandle, src, &openInfo);
-   if (ret != CELL_OK) { cellJpgDecDestroy(mainHandle); return -1; }
-
-   ret = cellJpgDecReadHeader(mainHandle, subHandle, &info);
-   if (ret != CELL_OK) { cellJpgDecClose(mainHandle, subHandle); cellJpgDecDestroy(mainHandle); return -1; }
-
-   // choose the smallest codec downscale (1/2/4/8) that brings both dimensions
-   // within the RSX texture limit, so a big camera JPEG decodes to a legal size.
-   uint32_t downScale = 1;
-   while (downScale < 8 &&
-          ((info.imageWidth  + downScale - 1) / downScale > MAX_TEX_DIM ||
-           (info.imageHeight + downScale - 1) / downScale > MAX_TEX_DIM))
-      downScale <<= 1;
-
-   // output ARGB8888. zero first so reserved[] is clean.
-   memset(&inParam, 0, sizeof(inParam));
-   inParam.commandPtr       = NULL;
-   inParam.downScale        = downScale;
-   inParam.method           = CELL_JPGDEC_QUALITY;
-   inParam.outputMode       = CELL_JPGDEC_TOP_TO_BOTTOM;
-   inParam.outputColorSpace = CELL_JPG_ARGB;
-   inParam.outputColorAlpha = 0xff;  // JPEG has no alpha; force opaque
-
-   ret = cellJpgDecSetParameter(mainHandle, subHandle, &inParam, &outParam);
-   if (ret != CELL_OK) { cellJpgDecClose(mainHandle, subHandle); cellJpgDecDestroy(mainHandle); return -1; }
-
-   uint32_t w = outParam.outputWidth;
-   uint32_t h = outParam.outputHeight;
-   uint32_t stride = (uint32_t)JPG_OUTPUT_WIDTH_BYTES(outParam);
-
-   // guard: even at 1/8 an enormous image could exceed the limit.
-   if (w > MAX_TEX_DIM || h > MAX_TEX_DIM) {
-      logError("[image-loader] JPEG too large for RSX: %ux%u (max %d)\n", w, h, MAX_TEX_DIM);
-      cellJpgDecClose(mainHandle, subHandle); cellJpgDecDestroy(mainHandle);
+   if (setjmp(state->error.jump)) {
+      if (cinfo->mem) jpeg_destroy_decompress(cinfo);
+      free(state->row);
+      free(state->pixels);
+      free(state);
+      logError("[image-loader] software JPEG decode failed\n");
       return -1;
    }
 
-   void *buf = malloc(stride * h);
-   if (!buf) { cellJpgDecClose(mainHandle, subHandle); cellJpgDecDestroy(mainHandle); return -1; }
+   jpeg_create_decompress(cinfo);
+   jpeg_mem_src(cinfo, (unsigned char *)data, (unsigned long)size);
+   if (jpeg_read_header(cinfo, TRUE) != JPEG_HEADER_OK) goto decode_failed;
 
-   ctrl.outputBytesPerLine = stride;
-   ret = cellJpgDecDecodeData(mainHandle, subHandle, (uint8_t *)buf, &ctrl, &dataInfo);
-   cellJpgDecClose(mainHandle, subHandle);
-   cellJpgDecDestroy(mainHandle);
+   // Keep both the texture dimensions and memory use bounded. libjpeg supports
+   // 1/2, 1/4 and 1/8 output scales, which avoids allocating a full-size camera
+   // image merely to make a small on-screen thumbnail.
+   for (;;) {
+      scaledW = ((uint64_t)cinfo->image_width + scale - 1) / scale;
+      scaledH = ((uint64_t)cinfo->image_height + scale - 1) / scale;
+      pixelCount = scaledW * scaledH;
+      if ((scaledW <= MAX_TEX_DIM && scaledH <= MAX_TEX_DIM &&
+           pixelCount <= MAX_DECODE_PIXELS) || scale == 8)
+         break;
+      scale <<= 1;
+   }
+   if (scaledW > MAX_TEX_DIM || scaledH > MAX_TEX_DIM ||
+       pixelCount > MAX_DECODE_PIXELS)
+      goto decode_failed;
 
-   if (ret != CELL_OK || IMAGE_DECODE_STATUS(dataInfo) != CELL_JPGDEC_DEC_STATUS_FINISH) { free(buf); return -1; }
+   cinfo->scale_num = 1;
+   cinfo->scale_denom = scale;
+   cinfo->out_color_space = JCS_RGB;
+   if (!jpeg_start_decompress(cinfo) || cinfo->output_components != 3)
+      goto decode_failed;
 
-   out->pixels = buf;
-   out->w = (int)w;
-   out->h = (int)h;
-   out->pitch = (int)stride;
+   // Use the decoder's actual dimensions (it may round scaled dimensions up).
+   if (cinfo->output_width == 0 || cinfo->output_height == 0 ||
+       cinfo->output_width > MAX_TEX_DIM || cinfo->output_height > MAX_TEX_DIM ||
+       (uint64_t)cinfo->output_width * cinfo->output_height > MAX_DECODE_PIXELS)
+      goto decode_failed;
+   pitch = (uint64_t)cinfo->output_width * 4;
+   if (pitch > 0x7fffffffU || pitch * cinfo->output_height > 0x7fffffffU)
+      goto decode_failed;
+
+   state->pixels = (uint8_t *)malloc((size_t)(pitch * cinfo->output_height));
+   state->row = (JSAMPLE *)malloc((size_t)cinfo->output_width * 3);
+   if (!state->pixels || !state->row) goto decode_failed;
+
+   while (cinfo->output_scanline < cinfo->output_height) {
+      JDIMENSION y = cinfo->output_scanline;
+      JSAMPROW row = state->row;
+      uint32_t x;
+      if (jpeg_read_scanlines(cinfo, &row, 1) != 1) goto decode_failed;
+
+      // The renderer consumes native A8R8G8B8 pixels. On the PS3's big-endian
+      // PPU this packed word is stored as A, R, G, B bytes.
+      uint32_t *dst = (uint32_t *)(state->pixels + (uint64_t)y * pitch);
+      for (x = 0; x < cinfo->output_width; ++x) {
+         uint32_t r = state->row[x * 3 + 0];
+         uint32_t g = state->row[x * 3 + 1];
+         uint32_t b = state->row[x * 3 + 2];
+         dst[x] = 0xff000000u | (r << 16) | (g << 8) | b;
+      }
+   }
+   if (!jpeg_finish_decompress(cinfo)) goto decode_failed;
+
+   out->pixels = state->pixels;
+   out->w = (int)cinfo->output_width;
+   out->h = (int)cinfo->output_height;
+   out->pitch = (int)pitch;
+   state->pixels = NULL;
+   jpeg_destroy_decompress(cinfo);
+   free(state->row);
+   free(state);
    return 0;
+
+decode_failed:
+   if (cinfo->mem) jpeg_destroy_decompress(cinfo);
+   free(state->row);
+   free(state->pixels);
+   free(state);
+   logError("[image-loader] unsupported or invalid JPEG image\n");
+   return -1;
 }
 
 static int decodeImageMem(const void *data, uint32_t size, ImageBuffer *out);
@@ -276,7 +315,7 @@ static int decodeImageMem(const void *data, uint32_t size, ImageBuffer *out)
    if (size >= 8 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G')
       { CellPngDecSrc s; pngSrcMem(&s, data, size); return decodePng(&s, out); }
    if (size >= 2 && b[0] == 0xFF && b[1] == 0xD8)
-      { CellJpgDecSrc s; jpgSrcMem(&s, data, size); return decodeJpeg(&s, out); }
+      return decodeJpeg(data, size, out);
 
    logError("[image-loader] unrecognised image header in memory buffer (%u bytes)\n", size);
    return -1;
@@ -353,6 +392,9 @@ static int           imgInit;          // lock created + worker started
 static volatile int  workerStarted;
 
 static char     reqPath[MAX_PATH_LEN];
+static uint8_t *reqData;               // owned copy for an in-memory decode request not yet taken by worker
+static uint32_t reqDataSize;
+static int      reqFromMemory;
 static uint32_t reqGen;                // newest request id
 static int      reqPending;            // a new request awaits the worker
 
@@ -365,13 +407,19 @@ static void imgWorker(uint64_t arg)
    (void)arg;
    for (;;) {
       char     path[MAX_PATH_LEN];
-      uint32_t gen = 0;
-      int      have = 0;
+      uint8_t *data = NULL;
+      uint32_t dataSize = 0, gen = 0;
+      int      fromMemory = 0, have = 0;
 
       lock(&imgLock);
       if (reqPending) {
          strCopy(path, sizeof path, reqPath);
          gen = reqGen;
+         fromMemory = reqFromMemory;
+         data = reqData;
+         dataSize = reqDataSize;
+         reqData = NULL;
+         reqDataSize = 0;
          reqPending = 0;
          have = 1;
       }
@@ -380,7 +428,16 @@ static void imgWorker(uint64_t arg)
       if (!have) { sleepMs(8); continue; }
 
       ImageBuffer b = { 0, 0, 0, 0 };
-      int ok = (decodeImageToBuffer(path, &b) == 0);
+      int ok;
+      if (fromMemory) {
+         logInfo("[image-loader] memory decode start (%u bytes)\n", dataSize);
+         int rc = data ? decodeImageMem(data, dataSize, &b) : -1;
+         ok = rc == 0;
+         logInfo("[image-loader] memory decode returned rc=%d size=%dx%d\n", rc, b.w, b.h);
+         free(data);
+      } else {
+         ok = decodeImageToBuffer(path, &b) == 0;
+      }
 
       lock(&imgLock);
       if (gen == reqGen) {
@@ -405,22 +462,60 @@ static void ensureWorker(void)
    }
    if (!workerStarted) {
       sys_ppu_thread_t tid;
-      if (spawnThread(&tid, imgWorker, 0, THREAD_PRIORITY_LOW, THREAD_STACK_SIZE_64KB, "img-decode") == 0)
+      if (spawnThread(&tid, imgWorker, 0, THREAD_PRIORITY_LOW, 128 * 1024, "img-decode") == 0)
          workerStarted = 1;
    }
+}
+
+static void supersedeImageRequest(void)
+{
+   reqGen++;
+   reqPending = 0;
+   if (reqData) { free(reqData); reqData = NULL; }
+   reqDataSize = 0;
+   reqFromMemory = 0;
+   if (resState == 1) freeImageBuffer(&resBuf);
+   resState = 0;
 }
 
 void requestImageAsync(const char *path)
 {
    ensureWorker();
+   if (!workerStarted) return;
 
    lock(&imgLock);
+   supersedeImageRequest();
    strCopy(reqPath, sizeof reqPath, path);
-   reqGen++;
    reqPending = 1;
-   // any result still sitting around belongs to an older request now
-   if (resState == 1) freeImageBuffer(&resBuf);
-   resState = 0;
+   unlock(&imgLock);
+}
+
+int requestImageMemAsync(const void *data, uint32_t size)
+{
+   if (!data || size == 0) return -1;
+   uint8_t *copy = (uint8_t *)malloc(size);
+   if (!copy) return -1;
+   memcpy(copy, data, size);
+
+   ensureWorker();
+   if (!workerStarted) { free(copy); return -1; }
+
+   lock(&imgLock);
+   supersedeImageRequest();
+   reqPath[0] = '\0';
+   reqData = copy;
+   reqDataSize = size;
+   reqFromMemory = 1;
+   reqPending = 1;
+   unlock(&imgLock);
+   return 0;
+}
+
+void cancelImageAsync(void)
+{
+   if (!imgInit) return;
+   lock(&imgLock);
+   supersedeImageRequest();
    unlock(&imgLock);
 }
 

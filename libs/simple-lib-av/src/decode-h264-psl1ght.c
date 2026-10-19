@@ -16,9 +16,9 @@
 #include <sysmodule/sysmodule.h>
 
 #define PICOUT_TIME_RING 32
-#define VDEC_SPU_COUNT 3
-#define VDEC_PPU_PRIORITY 500
-#define VDEC_SPU_PRIORITY 250
+#define VDEC_SPU_COUNT 4
+#define VDEC_PPU_PRIORITY 300
+#define VDEC_SPU_PRIORITY 100
 #define VDEC_PPU_STACK_SIZE 0x40000
 
 struct H264Decoder {
@@ -30,6 +30,7 @@ struct H264Decoder {
    opd32 callbackOpd;
 
    int auFedCount;
+   int alternateSkipEnabled;
    volatile int auDoneCount;
    volatile int picPending;
    volatile int seqDone;
@@ -162,6 +163,14 @@ fail:
    return NULL;
 }
 
+void setH264DecoderAlternateSkip(H264Decoder *decoder, int enabled)
+{
+   if (!decoder) return;
+   decoder->alternateSkipEnabled = enabled != 0;
+   if (decoder->alternateSkipEnabled)
+      logInfo("[decode-h264] alternating skip-non-reference mode enabled\n");
+}
+
 int decodeAuH264(H264Decoder *decoder, const uint8_t *data, int size, uint64_t pts)
 {
    if (!decoder || decoder->errored || !data || size <= 0) return -1;
@@ -180,7 +189,10 @@ int decodeAuH264(H264Decoder *decoder, const uint8_t *data, int size, uint64_t p
    au.dts.hi = VDEC_TS_INVALID;
    au.userdata = pts;
 
-   s32 result = vdecDecodeAu(decoder->handle, VDEC_DECODER_MODE_NORMAL, &au);
+   u32 mode = VDEC_DECODER_MODE_NORMAL;
+   if (decoder->alternateSkipEnabled && (decoder->auFedCount & 1))
+      mode = VDEC_DECODER_MODE_SKIP_NON_REF;
+   s32 result = vdecDecodeAu(decoder->handle, mode, &au);
    if (result == 0) { decoder->auFedCount++; return 0; }
    if (result == (s32)VDEC_ERROR_BUSY) return 1;
    logError("[decode-h264] DecodeAu failed 0x%x\n", result);

@@ -22,13 +22,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define MARGIN_X      50
-#define HEADER_Y      26
-#define TITLE_SIZE    26
-#define GRID_TOP      74
-#define HINTS_BOTTOM  42        // hint-row top offset from the screen bottom (overlaid, no layout shift)
-#define HINT_GLYPH_H  22
-#define HINT_TEXT     18
+#define MARGIN_X      80
+#define HEADER_Y      54
+#define TITLE_SIZE    30
+#define GRID_TOP      100
+#define HINTS_BOTTOM  88        // hint-row top offset from the screen bottom (overlaid, no layout shift)
+#define HINT_GLYPH_H  28
+#define HINT_TEXT     22
 
 static const char *TrendingNames[TREND_COUNT] = { "Gaming", "Sports", "Podcasts" };
 static const char *AccountNames[ACCOUNT_FEED_COUNT] = { "Recommended", "Subscriptions", "History", "Watch Later" };
@@ -315,7 +315,7 @@ static void initHome(void)
    panelConfirmHint = addButtonHint(&panelHints, getConsoleGlyph(GLYPH_CROSS),  "Try again");
    panelBackHint    = addButtonHint(&panelHints, getConsoleGlyph(GLYPH_CIRCLE), "Close");
 
-   initVideoGrid(&home.grid, &uiFont, MARGIN_X, GRID_TOP, home.screenW - 2 * MARGIN_X, home.screenH - GRID_TOP);
+   initVideoGrid(&home.grid, &uiFont, MARGIN_X, GRID_TOP, home.screenW - 2 * MARGIN_X, home.screenH - GRID_TOP - HINTS_BOTTOM - HINT_GLYPH_H - 24);
    setGridWatchedPredicate(&home.grid, isWatched);
    setGridWatchLaterPredicate(&home.grid, isWatchLater);
 

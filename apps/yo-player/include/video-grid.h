@@ -15,7 +15,7 @@
 #include <stdint.h>
 
 #define GRID_COLS     4
-#define GRID_THREADS  4         // parallel thumbnail fetch threads
+#define GRID_THREADS  1         // serialize TLS/JPEG network pressure on PS3
 
 typedef enum { GRID_RUNNING, GRID_READY, GRID_EMPTY } GridStage;
 
@@ -28,7 +28,7 @@ typedef int (*GridFetchFn)(const char *token, SearchResults *out, void *user);
 
 // one thumbnail: jpeg fetched by the worker and kept; the texture is decoded only while the tile is in the
 // visible window (tex.offset != 0) and freed when it scrolls away, re-decoding from the kept jpeg on return.
-typedef enum { THUMB_NONE, THUMB_FETCHED, THUMB_FAILED } ThumbState;
+typedef enum { THUMB_NONE, THUMB_FETCHED, THUMB_DECODING, THUMB_FAILED } ThumbState;
 typedef struct {
    volatile ThumbState state;
    uint8_t   *jpeg;
@@ -56,6 +56,7 @@ typedef struct {
    volatile int     searchParsed, workerDone, stopWorker;
    GridJob          job;
    int              thumbFetched;                          // thumbnails fetched so far (contiguous from 0)
+   int              decodeIndex;                           // thumbnail currently decoding asynchronously, or -1
    int              threadActive, reloadPending;
    sys_ppu_thread_t workerTid;
    volatile int     thumbNext, thumbEnd;

@@ -12,6 +12,8 @@
 #include "theme.h"
 #include "pad.h"
 #include "http.h"
+#include "image-loader.h"
+#include "dbg.h"
 #include "string-utilities.h"   // strCopy
 #include <string.h>
 #include <stdio.h>
@@ -24,8 +26,8 @@
 #define DUR_SIZE    19
 #define WATCHLATER_BADGE_SIZE DUR_SIZE
 #define MARGIN_ROWS 2           // rows kept materialised above and below the visible band
-#define THUMB_LOOKAHEAD_ROWS 3  // rows below the visible band to fetch thumbnails for ahead of scrolling
-#define DECODES_PER_FRAME 3
+#define THUMB_LOOKAHEAD_ROWS 0  // fetch only visible thumbnails on PS3; extend as the user scrolls
+#define DECODES_PER_FRAME 1
 #define THUMB_CAP   (96 * 1024) // one mqdefault jpeg fits easily
 #define THUMB_UA    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
@@ -54,9 +56,14 @@ static void thumbFetchThread(uint64_t arg)
                grid->thumbs[i].jpeg = copy; grid->thumbs[i].jpegLen = length;
                __sync_synchronize();
                grid->thumbs[i].state = THUMB_FETCHED;
+               logInfo("[grid] thumbnail %s fetched (%d bytes)\n", grid->results.items[i].videoId, length);
+            } else {
+               grid->thumbs[i].state = THUMB_FAILED;
+               logWarn("[grid] thumbnail %s skipped (out of memory)\n", grid->results.items[i].videoId);
             }
          } else {
             grid->thumbs[i].state = THUMB_FAILED;
+            logWarn("[grid] thumbnail %s failed rc=%d status=%d bytes=%d\n", grid->results.items[i].videoId, rc, status, length);
          }
       }
       free(buffer);
@@ -67,15 +74,18 @@ static void thumbFetchThread(uint64_t arg)
 // fetch thumbnails for results [from, to) in parallel; returns once every one has landed or failed.
 static void fetchThumbnailsRange(VideoGrid *grid, int from, int to)
 {
+   if (to <= from) return;
+   logInfo("[grid] fetching %d thumbnails from %d\n", to - from, from);
    grid->thumbNext = from;
    grid->thumbEnd = to;
    sys_ppu_thread_t threads[GRID_THREADS];
    int spawned = 0;
    for (int t = 0; t < GRID_THREADS; t++)
       if (spawnJoinableThread(&threads[spawned], thumbFetchThread, (uint64_t)(uintptr_t)grid,
-                              THREAD_PRIORITY_DEFAULT, THREAD_STACK_SIZE_64KB, "yt-thumb") == 0)
+                              THREAD_PRIORITY_LOW, 128 * 1024, "yt-thumb") == 0)
          spawned++;
    for (int t = 0; t < spawned; t++) joinThread(threads[t]);
+   logInfo("[grid] thumbnail batch finished\n");
 }
 
 // append a fetched page's items, skipping videoIds we already have. sortTokens (channel chips) are kept
@@ -155,8 +165,19 @@ static int spawnWorker(VideoGrid *grid)
 
 // ---- tile windowing (UI side) ----
 
+static void cancelGridDecode(VideoGrid *grid)
+{
+   if (grid->decodeIndex < 0) return;
+   int i = grid->decodeIndex;
+   cancelImageAsync();
+   if (i < grid->results.count && grid->thumbs[i].state == THUMB_DECODING)
+      grid->thumbs[i].state = THUMB_FETCHED;
+   grid->decodeIndex = -1;
+}
+
 static void freeThumbnails(VideoGrid *grid)
 {
+   cancelGridDecode(grid);
    finishGfx();
    for (int i = 0; i < MAX_SEARCH_RESULTS; i++) {
       if (grid->thumbs[i].jpeg) { free(grid->thumbs[i].jpeg); grid->thumbs[i].jpeg = NULL; }
@@ -173,6 +194,7 @@ static void resetFeed(VideoGrid *grid)
    grid->stage = GRID_RUNNING;
    grid->searchParsed = grid->workerDone = 0;
    grid->thumbFetched = 0;
+   grid->decodeIndex = -1;
    grid->selected = grid->scrollRow = grid->winStart = grid->winEnd = 0;
 }
 
@@ -267,12 +289,49 @@ static void reconcileWindow(VideoGrid *grid)
 
 static void decodeWindowThumbnails(VideoGrid *grid)
 {
-   int done = 0;
-   for (int i = grid->winStart; i < grid->winEnd && done < DECODES_PER_FRAME; i++)
-      if (grid->thumbs[i].state == THUMB_FETCHED && grid->thumbs[i].jpeg && !grid->thumbs[i].tex.offset) {
-         grid->thumbs[i].tex = loadGfxTextureMem(grid->thumbs[i].jpeg, (uint32_t)grid->thumbs[i].jpegLen);
-         done++;
+   if (grid->decodeIndex >= 0) {
+      ImageBuffer decoded = { 0, 0, 0, 0 };
+      int rc = pollImageAsync(&decoded);
+      if (rc == 0) return;
+
+      int i = grid->decodeIndex;
+      grid->decodeIndex = -1;
+      if (i >= 0 && i < grid->results.count && grid->thumbs[i].state == THUMB_DECODING) {
+         int row = i / GRID_COLS;
+         int visible = row >= grid->scrollRow && row < grid->scrollRow + grid->visibleRows;
+         if (rc > 0 && visible) {
+            grid->thumbs[i].tex = uploadImageBuffer(&decoded);
+            if (grid->thumbs[i].tex.offset)
+               logInfo("[grid] thumbnail %s decoded and uploaded\n", grid->results.items[i].videoId);
+            else {
+               grid->thumbs[i].state = THUMB_FAILED;
+               logWarn("[grid] thumbnail %s texture upload failed\n", grid->results.items[i].videoId);
+            }
+         } else if (rc > 0) {
+            // It scrolled away while decoding. Keep the JPEG and defer upload until visible again.
+            grid->thumbs[i].state = THUMB_FETCHED;
+         } else {
+            grid->thumbs[i].state = THUMB_FAILED;
+            logWarn("[grid] thumbnail %s JPEG decode failed\n", grid->results.items[i].videoId);
+         }
       }
+      if (rc > 0) freeImageBuffer(&decoded);
+   }
+
+   for (int i = grid->winStart; i < grid->winEnd; i++) {
+      int row = i / GRID_COLS;
+      if (row < grid->scrollRow || row >= grid->scrollRow + grid->visibleRows) continue;
+      if (grid->thumbs[i].state != THUMB_FETCHED || !grid->thumbs[i].jpeg || grid->thumbs[i].tex.offset) continue;
+      if (requestImageMemAsync(grid->thumbs[i].jpeg, (uint32_t)grid->thumbs[i].jpegLen) == 0) {
+         grid->thumbs[i].state = THUMB_DECODING;
+         grid->decodeIndex = i;
+         logInfo("[grid] thumbnail %s decode queued\n", grid->results.items[i].videoId);
+      } else {
+         grid->thumbs[i].state = THUMB_FAILED;
+         logWarn("[grid] thumbnail %s decode queue failed\n", grid->results.items[i].videoId);
+      }
+      break;  // one image decoder job at a time
+   }
 }
 
 // left/right step one tile and wrap onto the previous/next row when they exist; up/down step a whole row.
@@ -287,6 +346,7 @@ static void moveSelection(VideoGrid *grid, int delta)
 void initVideoGrid(VideoGrid *grid, Font *font, int x, int y, int width, int height)
 {
    memset(grid, 0, sizeof *grid);
+   grid->decodeIndex = -1;
    grid->font = font;
    grid->x = x; grid->y = y; grid->width = width; grid->height = height;
 
@@ -335,6 +395,7 @@ void stopVideoGrid(VideoGrid *grid)
 {
    if (grid->threadActive) { grid->stopWorker = 1; joinThread(grid->workerTid); grid->threadActive = 0; }
    grid->reloadPending = 0;
+   cancelGridDecode(grid);
 }
 
 void updateVideoGrid(VideoGrid *grid)

@@ -1,8 +1,15 @@
-// font - truetype font rendering via libfont/freetype
+// font - truetype font rendering via stb_truetype
+//
+// Text is rasterised in the app. The firmware font libraries (libfont / libfontFT) are deliberately not
+// linked: a static import of those PRX libraries stops the process loader on a console, so the app never
+// reaches main(). System fonts are plain files in /dev_flash/data/font, read like any other file.
+//
+// A Font is a chain of faces. A glyph comes from the first face that has it, so one Font covers Latin, kana,
+// CJK and symbols the way the firmware's own font sets do. Only the first face is loaded when a Font is
+// opened; the others load the first time a glyph at or above their minimum code point is needed, which keeps
+// the multi-megabyte CJK files off the heap until a title actually uses them. Faces are shared between Fonts
+// and reference counted, so reopening a system font on every screen costs nothing.
 #include "font.h"
-#include <cell/font.h>
-#include <cell/fontFT.h>
-#include <cell/sysmodule.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -11,135 +18,191 @@
 #include "dbg.h"
 #include "vfs.h"
 
+#define STB_TRUETYPE_IMPLEMENTATION
+#define STBTT_STATIC
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wmisleading-indentation"
+#include "stb_truetype.h"
+#pragma GCC diagnostic pop
+
+#include "font-embedded.h"
+
+#ifndef FONT_SYSTEM_DIR
+#define FONT_SYSTEM_DIR "/dev_flash/data/font/"
+#endif
+
 static const int FONT_MAX_RENDER_W = 1024;
 static const size_t FONT_MAX_SURFACE_BYTES = 16u * 1024u * 1024u;   // sanity cap for the rasterize() scratch buffer
+static const uint64_t FONT_MAX_FILE_BYTES = 16u * 1024u * 1024u;    // the largest firmware face is ~8 MB
 
-static const CellFontLibrary *fontLib = NULL;
-static CellFontRenderer       activeFontRenderer;
-static int                    fontInited = 0;
+#define FONT_MAX_FACES 8
+#define FACE_CACHE_MAX 24
+#define FONT_ITALIC_SLANT 0.35f
 
-static void *fontMalloc(void *obj, uint32_t size) { (void)obj; return malloc(size); }
-static void  fontFree(void *obj, void *p) { (void)obj; free(p); }
-static void *fontRealloc(void *obj, void *p, uint32_t size) { (void)obj; return realloc(p, size); }
-static void *fontCalloc(void *obj, uint32_t n, uint32_t sz) { (void)obj; return calloc(n, sz); }
+typedef struct {
+   char           path[96];   // cache key; "" for a face that belongs to one Font only (file / memory)
+   uint8_t       *data;
+   uint32_t       size;
+   int            ownsData;   // free(data) when the last reference goes
+   int            state;      // 0 = not loaded yet, 1 = ready, -1 = unavailable
+   int            refs;
+   stbtt_fontinfo info;
+} SharedFace;
+
+struct FontData {
+   SharedFace *faces[FONT_MAX_FACES];
+   uint32_t    minCode[FONT_MAX_FACES];   // the face is only consulted for code points >= this
+   int         nFaces;
+};
+
+static SharedFace faceCache[FACE_CACHE_MAX];
+static int        fontInited = 0;
 
 int initFont(void)
 {
-   if (fontInited) return 0;
-
-   int rc;
-   logInfo("[font] loading FONT module\n");
-   rc = cellSysmoduleLoadModule(CELL_SYSMODULE_FONT);
-   logInfo("[font] FONT module rc=0x%08x\n", (unsigned int)rc);
-   if (rc != CELL_OK) return -1;
-   rc = cellSysmoduleLoadModule(CELL_SYSMODULE_FREETYPE);
-   logInfo("[font] FREETYPE module rc=0x%08x\n", (unsigned int)rc);
-   if (rc != CELL_OK) return -1;
-   rc = cellSysmoduleLoadModule(CELL_SYSMODULE_FONTFT);
-   logInfo("[font] FONTFT module rc=0x%08x\n", (unsigned int)rc);
-   if (rc != CELL_OK) return -1;
-
-   static uint32_t fontFileCache[256 * 1024 / sizeof(uint32_t)];
-   // Slots for user fonts opened via openFontFile/openFontMemory. CellFontConfig_initialize
-   // defaults userFontEntryMax to 0, so without this any user-font open returns
-   // CELL_FONT_ERROR_FONT_OPEN_MAX (0x8054000d). (System fonts don't use these slots.)
-   static CellFontEntry userFontEntries[8];
-
-   CellFontConfig fconfig;
-   CellFontConfig_initialize(&fconfig);
-   fconfig.fileCache.buffer = fontFileCache;
-   fconfig.fileCache.size   = sizeof(fontFileCache);
-   fconfig.flags = 0;
-   fconfig.userFontEntryMax  = 8;
-   fconfig.userFontEntries   = userFontEntries;
-   logInfo("[font] initializing libfont\n");
-   rc = cellFontInit(&fconfig);
-   logInfo("[font] libfont rc=0x%08x\n", (unsigned int)rc);
-   if (rc != CELL_OK) return -1;
-
-   CellFontLibraryConfigFT config;
-   CellFontLibraryConfigFT_initialize(&config);
-   config.MemoryIF.Object  = NULL;
-   config.MemoryIF.Malloc  = fontMalloc;
-   config.MemoryIF.Free    = fontFree;
-   config.MemoryIF.Realloc = fontRealloc;
-   config.MemoryIF.Calloc  = fontCalloc;
-
-   logInfo("[font] initializing FreeType library\n");
-   rc = cellFontInitLibraryFreeType(&config, &fontLib);
-   logInfo("[font] FreeType rc=0x%08x lib=%p\n", (unsigned int)rc, fontLib);
-   if (rc != CELL_OK) return -1;
-
-   CellFontRendererConfig rconfig;
-   CellFontRendererConfig_initialize(&rconfig);
-   CellFontRendererConfig_setAllocateBuffer(&rconfig, 1024 * 64, 0);
-   logInfo("[font] creating renderer\n");
-   rc = cellFontCreateRenderer(fontLib, &rconfig, &activeFontRenderer);
-   logInfo("[font] renderer rc=0x%08x\n", (unsigned int)rc);
-   if (rc != CELL_OK) return -1;
-
    fontInited = 1;
    return 0;
 }
 
 void termFont(void)
 {
-   if (!fontInited) return;
-   cellFontDestroyRenderer(&activeFontRenderer);
-   cellFontEndLibrary(fontLib);
-   cellFontEnd();
-   cellSysmoduleUnloadModule(CELL_SYSMODULE_FONTFT);
-   cellSysmoduleUnloadModule(CELL_SYSMODULE_FREETYPE);
-   cellSysmoduleUnloadModule(CELL_SYSMODULE_FONT);
    fontInited = 0;
 }
 
-Font openSystemFont(int type)
+// ---- face loading -----------------------------------------------------------------------------------
+
+static uint8_t *loadWholeFile(const char *path, uint32_t *outSize)
 {
-   Font f;
-   memset(&f, 0, sizeof(f));
+   VfsStat st;
+   if (statPath(path, &st) != 0 || st.size == 0 || st.size > FONT_MAX_FILE_BYTES) return NULL;
+   uint32_t size = (uint32_t)st.size;
 
-   if (!fontInited) initFont();
+   VfsFile file;
+   if (openFs(path, VFS_O_RDONLY, &file) != 0) return NULL;
 
-   int fontType;
-   switch (type) {
-      case FONT_POP:       fontType = CELL_FONT_TYPE_DEFAULT_GOTHIC_LATIN_SET; break;
-      case FONT_GOTHIC_JP: fontType = CELL_FONT_TYPE_DEFAULT_GOTHIC_JP_SET; break;
-      case FONT_SANS:      fontType = CELL_FONT_TYPE_DEFAULT_SANS_SERIF; break;
-      case FONT_SERIF:     fontType = CELL_FONT_TYPE_DEFAULT_SERIF; break;
-      default:             fontType = CELL_FONT_TYPE_DEFAULT_GOTHIC_LATIN_SET; break;
+   uint8_t *buf = (uint8_t *)malloc(size);
+   if (!buf) { closeFs(&file); return NULL; }
+
+   uint32_t got = 0;
+   while (got < size) {
+      int64_t n = readFs(&file, buf + got, size - got);
+      if (n <= 0) break;
+      got += (uint32_t)n;
    }
+   closeFs(&file);
+   if (got != size) { free(buf); return NULL; }
 
-   CellFontType ft;
-   ft.type = fontType;
-   ft.map  = CELL_FONT_MAP_UNICODE;
-
-   if (cellFontOpenFontset(fontLib, &ft, &f.font) == CELL_OK) {
-      f.open = 1;
-      cellFontSetResolutionDpi(&f.font, 72, 72);
-   }
-
-   return f;
+   *outSize = size;
+   return buf;
 }
 
-// cellFont caches opened faces by the `uniqueId` passed to cellFontOpenFont*; if two different
-// fonts share an id (the old hardcoded 0) the second open returns the FIRST cached face. Hand out a
-// fresh id per open so every font is distinct (e.g. the dialogue font and the in-game chat font).
-static int nextFontUid(void) { static int uid = 1; return uid++; }
+// Initialises the stb font over the face's bytes. 1 on success.
+static int initFaceInfo(SharedFace *fc)
+{
+   int off = stbtt_GetFontOffsetForIndex(fc->data, 0);
+   if (off < 0 || !stbtt_InitFont(&fc->info, fc->data, off)) {
+      fc->state = -1;
+      return 0;
+   }
+   fc->state = 1;
+   return 1;
+}
+
+static SharedFace *newFaceSlot(void)
+{
+   for (int i = 0; i < FACE_CACHE_MAX; i++)
+      if (faceCache[i].refs == 0) { memset(&faceCache[i], 0, sizeof(faceCache[i])); return &faceCache[i]; }
+   return NULL;
+}
+
+// A reference to the face stored at `path` (loaded on first use), shared with every Font that names it.
+static SharedFace *acquireFace(const char *path)
+{
+   for (int i = 0; i < FACE_CACHE_MAX; i++)
+      if (faceCache[i].refs > 0 && strcmp(faceCache[i].path, path) == 0) { faceCache[i].refs++; return &faceCache[i]; }
+
+   SharedFace *fc = newFaceSlot();
+   if (!fc) return NULL;
+   strncpy(fc->path, path, sizeof(fc->path) - 1);
+   fc->refs = 1;
+   return fc;
+}
+
+// The built-in Latin face: always present, needs no file.
+static SharedFace *acquireEmbeddedLatin(void)
+{
+   SharedFace *fc = acquireFace("embedded:latin");
+   if (fc && fc->state == 0) {
+      fc->data = (uint8_t *)embeddedLatinFont;
+      fc->size = embeddedLatinFontSize;
+      fc->ownsData = 0;
+      initFaceInfo(fc);
+   }
+   return fc;
+}
+
+static void releaseFace(SharedFace *fc)
+{
+   if (!fc || fc->refs <= 0) return;
+   if (--fc->refs > 0) return;
+   if (fc->ownsData) free(fc->data);
+   memset(fc, 0, sizeof(*fc));
+}
+
+// Loads a face on first use. 1 when it can be used.
+static int faceReady(SharedFace *fc)
+{
+   if (fc->state > 0) return 1;
+   if (fc->state < 0 || fc->path[0] == '\0') return 0;
+   uint32_t size = 0;
+   uint8_t *data = loadWholeFile(fc->path, &size);
+   if (!data) { fc->state = -1; logInfo("[font] cannot read %s\n", fc->path); return 0; }
+   fc->data = data;
+   fc->size = size;
+   fc->ownsData = 1;
+   logInfo("[font] loaded %s (%u bytes)\n", fc->path, size);
+   return initFaceInfo(fc);
+}
+
+static int fontAddFace(struct FontData *d, SharedFace *fc, uint32_t minCode)
+{
+   if (!fc) return 0;
+   if (d->nFaces >= FONT_MAX_FACES) { releaseFace(fc); return 0; }
+   d->faces[d->nFaces] = fc;
+   d->minCode[d->nFaces] = minCode;
+   d->nFaces++;
+   return 1;
+}
+
+static int fontAddSystemFace(struct FontData *d, const char *name, uint32_t minCode)
+{
+   char path[96];
+   if (strlen(FONT_SYSTEM_DIR) + strlen(name) + 1 > sizeof(path)) return 0;
+   strcpy(path, FONT_SYSTEM_DIR);
+   strcat(path, name);
+   return fontAddFace(d, acquireFace(path), minCode);
+}
+
+// ---- SFNT metrics -----------------------------------------------------------------------------------
 
 // Parse the SFNT (TrueType/OpenType) header for the hhea ascender/descender + head unitsPerEm, which is
-// what FreeType (and hence Ren'Py, ftfont.pyx) uses for the line height (ascender - descender). cellFont's
-// CellFontHorizontalLayout instead uses the OS/2 usWin* metrics, which over-space some OTF fonts. SFNT is
+// what FreeType (and hence Ren'Py, ftfont.pyx) uses for the line height (ascender - descender). SFNT is
 // big-endian. Fills f->unitsPerEm/hheaAscent/hheaDescent; unitsPerEm stays 0 if the tables aren't found.
+// useWin takes the OS/2 usWinAscent/usWinDescent instead of hhea: the firmware's own font layout is built
+// on those, and the system fonts' hhea box is much tighter (RD-R-LATIN: 0.78/-0.19 em against 1.03/-0.20),
+// so hhea would clip the tops of accents and shift every line relative to the UI laid out around it.
 static uint16_t sfntU16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static int16_t  sfntS16(const uint8_t *p) { return (int16_t)((p[0] << 8) | p[1]); }
 static uint32_t sfntU32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
-static void parseSfntMetrics(Font *f, const uint8_t *buf, uint32_t size)
+static void parseSfntMetrics(Font *f, const uint8_t *buf, uint32_t size, int useWin)
 {
    f->unitsPerEm = 0; f->hheaAscent = 0; f->hheaDescent = 0;
    if (!buf || size < 12) return;
    uint16_t numTables = sfntU16(buf + 4);     // offset table: u32 tag, u16 numTables, ...
-   uint32_t headOff = 0, hheaOff = 0;
+   uint32_t headOff = 0, hheaOff = 0, os2Off = 0;
    for (uint16_t i = 0; i < numTables; i++)
    {
       uint32_t rec = 12u + (uint32_t)i * 16u;   // each table record: tag(4) checksum(4) offset(4) length(4)
@@ -149,6 +212,7 @@ static void parseSfntMetrics(Font *f, const uint8_t *buf, uint32_t size)
       if (off > size) continue;   // reject bogus offsets before they can overflow the checks below
       if (tag[0]=='h'&&tag[1]=='e'&&tag[2]=='a'&&tag[3]=='d') headOff = off;
       else if (tag[0]=='h'&&tag[1]=='h'&&tag[2]=='e'&&tag[3]=='a') hheaOff = off;
+      else if (tag[0]=='O'&&tag[1]=='S'&&tag[2]=='/'&&tag[3]=='2') os2Off = off;
    }
    int upm = (headOff && headOff + 20u <= size) ? sfntU16(buf + headOff + 18) : 0;   // head.unitsPerEm @ +18
    if (hheaOff && hheaOff + 10u <= size && upm > 0)
@@ -156,83 +220,169 @@ static void parseSfntMetrics(Font *f, const uint8_t *buf, uint32_t size)
       f->hheaAscent  = sfntS16(buf + hheaOff + 4);   // hhea.ascender  @ +4
       f->hheaDescent = sfntS16(buf + hheaOff + 6);   // hhea.descender @ +6
       if (f->hheaAscent != 0 || f->hheaDescent != 0) f->unitsPerEm = upm;
+      if (useWin && f->unitsPerEm > 0 && os2Off && os2Off + 78u <= size) {
+         int winAscent = sfntU16(buf + os2Off + 74), winDescent = sfntU16(buf + os2Off + 76);   // usWinAscent/Descent
+         if (winAscent + winDescent > 0) { f->hheaAscent = winAscent; f->hheaDescent = -winDescent; }
+      }
    }
+}
+
+// ---- opening ----------------------------------------------------------------------------------------
+
+static Font openFromFirstFace(struct FontData *d, int useWinMetrics)
+{
+   Font f;
+   memset(&f, 0, sizeof(f));
+   if (!d || d->nFaces == 0 || !faceReady(d->faces[0])) {
+      if (d) {
+         for (int i = 0; i < d->nFaces; i++) releaseFace(d->faces[i]);
+         free(d);
+      }
+      return f;
+   }
+   f.data = d;
+   f.open = 1;
+   parseSfntMetrics(&f, d->faces[0]->data, d->faces[0]->size, useWinMetrics);
+   return f;
+}
+
+Font openSystemFont(int type)
+{
+   if (!fontInited) initFont();
+
+   struct FontData *d = (struct FontData *)calloc(1, sizeof(*d));
+   if (!d) { Font none; memset(&none, 0, sizeof(none)); return none; }
+
+   // The first face is the one whose metrics set the line height. The rest are glyph fallbacks, listed with
+   // the lowest code point they are asked about (ASCII text never touches a file).
+   switch (type) {
+      case FONT_GOTHIC_JP:
+         fontAddSystemFace(d, "SCE-PS3-NR-R-JPN.TTF", 0);
+         fontAddFace(d, acquireEmbeddedLatin(), 0);
+         fontAddSystemFace(d, "SCE-PS3-RD-R-LATIN2.TTF", 0x80);
+         fontAddSystemFace(d, "SCE-PS3-NR-R-EXT.TTF", 0x80);
+         fontAddSystemFace(d, "SCE-PS3-CP-R-KANA.TTF", 0x3000);
+         fontAddSystemFace(d, "SCE-PS3-DH-R-CGB.TTF", 0x2E80);
+         break;
+      case FONT_SANS:
+      case FONT_SERIF:
+         fontAddSystemFace(d, "SCE-PS3-SR-R-LATIN.TTF", 0);
+         fontAddSystemFace(d, "SCE-PS3-SR-R-LATIN2.TTF", 0x80);
+         fontAddSystemFace(d, "SCE-PS3-SR-R-EXT.TTF", 0x80);
+         fontAddFace(d, acquireEmbeddedLatin(), 0x80);
+         fontAddSystemFace(d, "SCE-PS3-SR-R-JPN.TTF", 0x0370);
+         fontAddSystemFace(d, "SCE-PS3-DH-R-CGB.TTF", 0x2E80);
+         break;
+      case FONT_POP:
+      default:
+         fontAddFace(d, acquireEmbeddedLatin(), 0);
+         fontAddSystemFace(d, "SCE-PS3-RD-R-LATIN2.TTF", 0x80);
+         fontAddSystemFace(d, "SCE-PS3-NR-R-EXT.TTF", 0x80);
+         fontAddSystemFace(d, "SCE-PS3-NR-R-JPN.TTF", 0x0370);
+         fontAddSystemFace(d, "SCE-PS3-CP-R-KANA.TTF", 0x3000);
+         fontAddSystemFace(d, "SCE-PS3-DH-R-CGB.TTF", 0x2E80);
+         break;
+   }
+   return openFromFirstFace(d, 1);
+}
+
+// A font that owns its bytes: `data` is freed with the last reference.
+static Font openOwnedFont(uint8_t *data, uint32_t size)
+{
+   Font none;
+   memset(&none, 0, sizeof(none));
+
+   struct FontData *d = (struct FontData *)calloc(1, sizeof(*d));
+   SharedFace *fc = d ? newFaceSlot() : NULL;
+   if (!d || !fc) { free(d); free(data); return none; }
+
+   fc->refs = 1;
+   fc->data = data;
+   fc->size = size;
+   fc->ownsData = 1;
+   initFaceInfo(fc);
+   d->faces[0] = fc;
+   d->nFaces = 1;
+   return openFromFirstFace(d, 0);
 }
 
 Font openFontFile(const char *path)
 {
-   Font f;
-   memset(&f, 0, sizeof(f));
-
+   Font none;
+   memset(&none, 0, sizeof(none));
    if (!fontInited) initFont();
 
-   // size via path-stat (the VFS has no fstat-by-handle); then open + read.
-   VfsStat st;
-   if (statPath(path, &st) != 0) return f;
-   uint32_t size = (uint32_t)st.size;
-
-   VfsFile file;
-   if (openFs(path, VFS_O_RDONLY, &file) != 0) return f;
-
-   void *buf = malloc(size);
-   if (!buf) { closeFs(&file); return f; }
-
-   readFs(&file, buf, size);
-   closeFs(&file);
-
-   if (cellFontOpenFontMemory(fontLib, buf, size, 0, nextFontUid(), &f.font) == CELL_OK) {
-      f.open = 1;
-      f.buffer = buf;  // cellFont keeps reading buf for the font's life; closeFont frees it
-      cellFontSetResolutionDpi(&f.font, 72, 72);
-      parseSfntMetrics(&f, buf, size);   // hhea/head metrics for the faithful (Ren'Py) line height
-   } else {
-      free(buf);
-   }
-
-   return f;
+   uint32_t size = 0;
+   uint8_t *buf = loadWholeFile(path, &size);
+   if (!buf) return none;
+   return openOwnedFont(buf, size);
 }
 
 Font openFontMemory(const void *buf, uint32_t size)
 {
-   Font f;
-   memset(&f, 0, sizeof(f));
-
+   Font none;
+   memset(&none, 0, sizeof(none));
    if (!fontInited) initFont();
-   if (!buf || size == 0) return f;
+   if (!buf || size == 0) return none;
 
-   // cellFont keeps reading the buffer for the font's lifetime, so own a private copy.
-   void *own = malloc(size);
-   if (!own) return f;
+   // the face keeps reading the bytes for the font's lifetime, so own a private copy.
+   uint8_t *own = (uint8_t *)malloc(size);
+   if (!own) return none;
    memcpy(own, buf, size);
-
-   int ret = cellFontOpenFontMemory(fontLib, own, size, 0, nextFontUid(), &f.font);
-   if (ret == CELL_OK) {
-      f.open = 1;
-      f.buffer = own;  // closeFont frees it
-      cellFontSetResolutionDpi(&f.font, 72, 72);
-      parseSfntMetrics(&f, (const uint8_t *)own, size);   // hhea/head metrics for the faithful line height
-   } else {
-      logError("[font] cellFontOpenFontMemory failed: 0x%x (size=%u)\n", ret, size);
-      free(own);
-   }
-
+   Font f = openOwnedFont(own, size);
+   if (!f.open) logError("[font] openFontMemory failed (size=%u)\n", size);
    return f;
 }
 
 void closeFont(Font *f)
 {
-   if (f->open) {
-      cellFontCloseFont(&f->font);
-      f->open = 0;
+   if (f->data) {
+      for (int i = 0; i < f->data->nFaces; i++) releaseFace(f->data->faces[i]);
+      free(f->data);
+      f->data = NULL;
    }
-   free(f->buffer);  // backing memory for openFontFile; NULL (safe) for system fonts
-   f->buffer = NULL;
+   f->open = 0;
 }
 
 void setFontMetrics(Font *f, FontMetricsMode mode, float grid)
 {
    f->metricsMode = (int)mode;
    f->metricsGrid = grid > 0.0f ? grid : 0.0f;
+}
+
+// ---- glyph lookup + metrics -------------------------------------------------------------------------
+
+typedef struct { SharedFace *face; int glyph; } GlyphRef;
+
+// Characters that take no space and draw nothing: controls, zero-width joiners/marks, variation selectors.
+static int isInvisible(uint32_t c)
+{
+   return c < 0x20 || c == 0x7F || (c >= 0x80 && c < 0xA0) || c == 0xAD ||
+          (c >= 0x200B && c <= 0x200F) || (c >= 0x202A && c <= 0x202E) || (c >= 0x2060 && c <= 0x2064) ||
+          (c >= 0xFE00 && c <= 0xFE0F) || c == 0xFEFF;
+}
+
+// The face + glyph index for a code point; face is NULL only when no face could be read at all.
+static GlyphRef lookupGlyph(const Font *f, uint32_t code)
+{
+   GlyphRef r = { NULL, 0 };
+   struct FontData *d = f->data;
+   if (!d) return r;
+   for (int i = 0; i < d->nFaces; i++) {
+      if (code < d->minCode[i]) continue;
+      SharedFace *fc = d->faces[i];
+      if (!faceReady(fc)) continue;
+      int g = stbtt_FindGlyphIndex(&fc->info, (int)code);
+      if (g) { r.face = fc; r.glyph = g; return r; }
+   }
+   // in no face: the first face's .notdef box
+   if (d->nFaces > 0 && faceReady(d->faces[0])) { r.face = d->faces[0]; r.glyph = 0; }
+   return r;
+}
+
+static float faceScale(const SharedFace *fc, float px)
+{
+   return stbtt_ScaleForMappingEmToPixels(&fc->info, px);
 }
 
 // Applies the font's advance model to a raw advance (see FontMetricsMode). The small
@@ -244,17 +394,30 @@ static float quantAdvance(const Font *f, float adv)
    return cells * f->metricsGrid;
 }
 
+// the unquantised advance of one code point at `px`, in output pixels
+static float rawAdvance(const Font *f, uint32_t code, float px)
+{
+   if (isInvisible(code)) return 0.0f;
+   GlyphRef r = lookupGlyph(f, code);
+   if (!r.face) return px;
+   int adv = 0, lsb = 0;
+   stbtt_GetGlyphHMetrics(&r.face->info, r.glyph, &adv, &lsb);
+   return (float)adv * faceScale(r.face, px);
+}
+
 // Kerning between two glyphs at the current scale, per the font's metrics mode.
 // NATIVE mode reports 0 (fractional-advance stacks don't kern); GRID_CEIL floors the
 // offset to the grid, matching classic stacks' integer `delta.x >> 6`.
-static float fontKern(Font *f, uint32_t prev, uint32_t code)
+static float fontKern(Font *f, uint32_t prev, uint32_t code, float px)
 {
    if (f->metricsMode != FONT_METRICS_GRID_CEIL || prev == 0) return 0.0f;
-   CellFontKerning k;
-   if (cellFontGetKerning(&f->font, prev, code, &k) != CELL_OK) return 0.0f;
-   if (k.offsetX == 0.0f) return 0.0f;
+   GlyphRef a = lookupGlyph(f, prev), b = lookupGlyph(f, code);
+   if (!a.face || a.face != b.face) return 0.0f;
+   int k = stbtt_GetGlyphKernAdvance(&a.face->info, a.glyph, b.glyph);
+   if (k == 0) return 0.0f;
+   float off = (float)k * faceScale(a.face, px);
    float g = f->metricsGrid > 0.0f ? f->metricsGrid : 1.0f;
-   return floorf(k.offsetX / g + 0.001f) * g;
+   return floorf(off / g + 0.001f) * g;
 }
 
 // decodes one utf-8 codepoint, advances *pp past it. returns codepoint.
@@ -283,18 +446,13 @@ float measureFontText(Font *f, int size, const char *text)
 {
    if (!f->open || !text) return 0.0f;
    float fsize = (float)size;
-   cellFontSetScalePixel(&f->font, fsize, fsize);
 
    float w = 0.0f;
    uint32_t prev = 0;
    const uint8_t *p = (const uint8_t *)text;
    while (*p) {
       uint32_t code = decodeUtf8(&p);
-      CellFontGlyphMetrics metrics;
-      if (cellFontGetCharGlyphMetrics(&f->font, code, &metrics) == CELL_OK)
-         w += quantAdvance(f, metrics.horizontal.advance) + fontKern(f, prev, code);
-      else
-         w += fsize;
+      w += quantAdvance(f, rawAdvance(f, code, fsize)) + fontKern(f, prev, code, fsize);
       prev = code;
    }
    return w;
@@ -302,15 +460,11 @@ float measureFontText(Font *f, int size, const char *text)
 
 float measureFontChar(Font *f, int size, uint32_t code)
 {
-   float fsize = (float)size;
-   cellFontSetScalePixel(&f->font, fsize, fsize);
-   CellFontGlyphMetrics metrics;
-   if (cellFontGetCharGlyphMetrics(&f->font, code, &metrics) == CELL_OK)
-      return quantAdvance(f, metrics.horizontal.advance);
-   return fsize;
+   if (!f->open) return (float)size;
+   return quantAdvance(f, rawAdvance(f, code, (float)size));
 }
 
-// inline style tags: {i} {b} {color=#rrggbb} (+ {{ and [[ escapes)
+// ---- inline style tags: {i} {b} {color=#rrggbb} (+ {{ and [[ escapes) ------------------------------
 // Lightweight inline markup for styled runs inside one string. Text is pre-parsed into
 // styled glyph items so tag handling stays separate from the (already fiddly)
 // wrapping/layout logic, which then just walks the item array.
@@ -366,9 +520,88 @@ static int parseStyledText(const char *text, uint32_t baseColor, GlyphItem *item
 
 static float getGlyphAdvance(Font *f, uint32_t code, float fsize)
 {
-   CellFontGlyphMetrics m;
-   if (cellFontGetCharGlyphMetrics(&f->font, code, &m) == CELL_OK) return quantAdvance(f, m.horizontal.advance);
-   return fsize;
+   return quantAdvance(f, rawAdvance(f, code, fsize));
+}
+
+// ---- glyph rasterising ------------------------------------------------------------------------------
+
+typedef struct {
+   uint8_t *bitmap;     // coverage, w*h bytes (malloc'd; NULL for a blank glyph such as a space)
+   int      w, h;
+   int      x, y;       // bitmap top-left relative to (ox, baseline), y down
+   int      ox;         // integer pen x the glyph was positioned at
+   float    advance;    // unquantised horizontal advance, output px
+   float    bearingY;   // how far the ink top sits above the baseline
+} GlyphBitmap;
+
+// Shears the bitmap about the baseline (row distance above it * slant), resampling horizontally with
+// linear interpolation so the slanted strokes stay smooth. Replaces gb->bitmap/w/x.
+static void shearGlyph(GlyphBitmap *gb, float slant)
+{
+   if (!gb->bitmap || gb->w <= 0 || gb->h <= 0) return;
+
+   float shiftTop = slant * (-(float)gb->y - 0.5f);
+   float shiftBot = slant * (-(float)(gb->y + gb->h - 1) - 0.5f);
+   float lo = shiftTop < shiftBot ? shiftTop : shiftBot;
+   float hi = shiftTop < shiftBot ? shiftBot : shiftTop;
+   int base = (int)floorf(lo);
+   int nw = gb->w + (int)ceilf(hi) - base + 2;
+
+   uint8_t *out = (uint8_t *)calloc((size_t)nw * (size_t)gb->h, 1);
+   if (!out) return;
+
+   for (int r = 0; r < gb->h; r++) {
+      float shift = slant * (-(float)(gb->y + r) - 0.5f);
+      float pos = shift - (float)base;
+      int ip = (int)floorf(pos);
+      float fr = pos - (float)ip;
+      const uint8_t *src = gb->bitmap + (size_t)r * gb->w;
+      uint8_t *dst = out + (size_t)r * nw;
+      for (int c = 0; c < gb->w; c++) {
+         int v = src[c];
+         if (v == 0) continue;
+         int a1 = (int)((float)v * fr + 0.5f);
+         int a0 = v - a1;
+         int i0 = ip + c, i1 = ip + c + 1;
+         if (i0 >= 0 && i0 < nw) { int t = dst[i0] + a0; dst[i0] = (uint8_t)(t > 255 ? 255 : t); }
+         if (i1 >= 0 && i1 < nw) { int t = dst[i1] + a1; dst[i1] = (uint8_t)(t > 255 ? 255 : t); }
+      }
+   }
+   free(gb->bitmap);
+   gb->bitmap = out;
+   gb->w = nw;
+   gb->x += base;
+}
+
+// Rasterises one code point at `px` with the pen at fractional x `penX`. 0 on success (a blank glyph
+// succeeds with bitmap == NULL), -1 when no face could be read. Free gb->bitmap afterwards.
+static int rasterGlyph(Font *f, uint32_t code, float px, int italic, float penX, GlyphBitmap *gb)
+{
+   memset(gb, 0, sizeof(*gb));
+   gb->ox = (int)floorf(penX);
+   if (isInvisible(code)) return 0;
+
+   GlyphRef r = lookupGlyph(f, code);
+   if (!r.face) return -1;
+
+   float s = faceScale(r.face, px);
+   int adv = 0, lsb = 0;
+   stbtt_GetGlyphHMetrics(&r.face->info, r.glyph, &adv, &lsb);
+   gb->advance = (float)adv * s;
+
+   float shiftX = penX - floorf(penX);
+   int x0, y0, x1, y1;
+   stbtt_GetGlyphBitmapBoxSubpixel(&r.face->info, r.glyph, s, s, shiftX, 0.0f, &x0, &y0, &x1, &y1);
+   int w = x1 - x0, h = y1 - y0;
+   if (w <= 0 || h <= 0 || (size_t)w * (size_t)h > (size_t)(4u * 1024u * 1024u)) return 0;
+
+   gb->bitmap = (uint8_t *)calloc((size_t)w * (size_t)h, 1);
+   if (!gb->bitmap) return -1;
+   stbtt_MakeGlyphBitmapSubpixel(&r.face->info, gb->bitmap, w, h, w, s, s, shiftX, 0.0f, r.glyph);
+   gb->w = w; gb->h = h; gb->x = x0; gb->y = y0;
+   gb->bearingY = (float)(-y0);
+   if (italic) shearGlyph(gb, FONT_ITALIC_SLANT);
+   return 0;
 }
 
 // Source-over composite of one glyph pixel (coverage a, colour cr/cg/cb) onto the surface
@@ -388,6 +621,7 @@ static inline void composePixel(uint8_t *d, int a, uint8_t cr, uint8_t cg, uint8
 }
 
 // Blits a rendered glyph's alpha bitmap into the surface, src-over composited.
+//   gx/gy     where the bitmap's top-left lands in the surface
 //   dx/dy     offset from the glyph's nominal position (used by the shadow pass)
 //   argb      colour; its ALPHA scales the glyph coverage (semi-transparent shadows/tags)
 //   overhang  synthetic-bold strength in px (0 = regular). Faithful to FreeType's
@@ -398,22 +632,21 @@ static inline void composePixel(uint8_t *d, int a, uint8_t cr, uint8_t cg, uint8
 //             rightmost stroke thickens too (FreeType widens the bitmap the same way).
 //             Reading from the glyph's own untouched bitmap matches FreeType's
 //             right-to-left in-place pass. The caller widens the pen advance separately.
-// Clipped against the surface bounds; surfBase/surfW/surfH locate the glyph's origin.
-static void blitGlyph(const CellFontImageTransInfo *ti, uint8_t *surfBase, int surfW, int surfH,
+// Clipped against the surface bounds.
+static void blitGlyph(const GlyphBitmap *gb, int gx, int gy, uint8_t *surfBase, int surfW, int surfH,
                       int dx, int dy, uint32_t argb, int overhang)
 {
-   const uint8_t *img = (const uint8_t *)ti->image;
-   int imgW = ti->imageWidth, imgH = ti->imageHeight;
-   int imgBW = ti->imageWidthByte, surfBW = ti->surfWidthByte;
+   if (!gb->bitmap) return;
+   const uint8_t *img = gb->bitmap;
+   int imgW = gb->w, imgH = gb->h;
+   int surfBW = surfW * 4;
    uint8_t cr = (uint8_t)((argb >> 16) & 0xFF), cg = (uint8_t)((argb >> 8) & 0xFF), cb = (uint8_t)(argb & 0xFF);
    int alpha = (int)((argb >> 24) & 0xFF);
-   int off = (int)((const uint8_t *)ti->surface - surfBase);
-   int gx = (off % surfBW) / 4, gy = off / surfBW;
    int outW = imgW + overhang;
    for (int iy = 0; iy < imgH; iy++) {
       int ty = gy + iy + dy;
       if (ty < 0 || ty >= surfH) continue;
-      const uint8_t *srow = img + iy * imgBW;
+      const uint8_t *srow = img + iy * imgW;
       uint8_t *drow = surfBase + ty * surfBW;
       for (int ix = 0; ix < outW; ix++) {
          int tx = gx + ix + dx;
@@ -431,6 +664,28 @@ static void blitGlyph(const CellFontImageTransInfo *ti, uint8_t *surfBase, int s
    }
 }
 
+// The line box for `size`: baseline offset from the line top and the line pitch. Ren'Py does it from the
+// FreeType (hhea) ascender/descender (renpy/text/ftfont.pyx): ascent = ceil(ascender*size/upm), descent =
+// floor(descender*size/upm), line height = ascent - descent (descent negative). A face without usable hhea
+// metrics falls back to stb_truetype's vertical metrics.
+static void getLineMetrics(Font *f, float fsize, float *lineH, float *baseY)
+{
+   float asc, dsc;
+   if (f->unitsPerEm > 0) {
+      asc = ceilf((float)f->hheaAscent  * fsize / (float)f->unitsPerEm);
+      dsc = floorf((float)f->hheaDescent * fsize / (float)f->unitsPerEm);   // descender is negative
+   } else {
+      SharedFace *fc = f->data->faces[0];
+      int a = 0, d = 0, gap = 0;
+      stbtt_GetFontVMetrics(&fc->info, &a, &d, &gap);
+      float s = faceScale(fc, fsize);
+      asc = ceilf((float)a * s);
+      dsc = floorf((float)d * s);
+   }
+   *baseY = asc;
+   *lineH = asc - dsc;
+}
+
 // width of the word starting at items[j0] (up to the next space/newline), including
 // kerning inside the word and for the (prevCode -> first glyph) pair. Used by the wrap
 // decision: a line breaks when "line + space + word" would exceed the target width.
@@ -439,7 +694,7 @@ static float getWordWidth(Font *f, const GlyphItem *items, int nItems, int j0, u
    float w = 0.0f;
    uint32_t prev = prevCode;
    for (int j = j0; j < nItems && items[j].code != ' ' && items[j].code != '\n'; j++) {
-      w += getGlyphAdvance(f, items[j].code, fsize) + fontKern(f, prev, items[j].code);
+      w += getGlyphAdvance(f, items[j].code, fsize) + fontKern(f, prev, items[j].code, fsize);
       prev = items[j].code;
    }
    return w;
@@ -479,8 +734,6 @@ static uint8_t *rasterize(Font *f, int size, const char *text, uint32_t color, i
    }
 
    float fsize = (float)size;
-   cellFontSetScalePixel(&f->font, fsize, fsize);
-   cellFontBindRenderer(&f->font, &activeFontRenderer);
 
    // Parse inline style tags into glyph items; layout/render walk this array.
    int cap = (int)strlen(text) + 1;
@@ -488,27 +741,8 @@ static uint8_t *rasterize(Font *f, int size, const char *text, uint32_t color, i
    if (!items) return NULL;
    int nItems = parseStyledText(text, color, items, cap, rawMode);
 
-   // Baseline + line pitch the way Ren'Py does it (renpy/text/ftfont.pyx): from the FreeType (hhea)
-   // ascender/descender -- ascent = ceil(ascender*size/upm), descent = floor(descender*size/upm),
-   // line height = ascent - descent (descent negative). cellFont's CellFontHorizontalLayout instead
-   // uses the OS/2 usWin* metrics, which are correct for fonts where they match hhea (e.g. primer.ttf)
-   // but over-tall for some OTFs (toony_loons.otf: win 1.273em vs hhea 0.985em -> the box stretched).
-   // Fall back to the cellFont layout only when the SFNT metrics weren't parsed (e.g. system fonts).
    float lineH, baseY;
-   if (f->unitsPerEm > 0)
-   {
-      float asc = ceilf((float)f->hheaAscent  * fsize / (float)f->unitsPerEm);
-      float dsc = floorf((float)f->hheaDescent * fsize / (float)f->unitsPerEm);   // descender is negative
-      baseY = asc;
-      lineH = asc - dsc;
-   }
-   else
-   {
-      CellFontHorizontalLayout layout;
-      cellFontGetHorizontalLayout(&f->font, &layout);
-      lineH = layout.lineHeight;
-      baseY = layout.baseLineY;
-   }
+   getLineMetrics(f, fsize, &lineH, &baseY);
 
    // count lines for height calculation (must mirror the wrap logic in the render loop;
    // kerning resets per line, since each laid-out line is measured independently)
@@ -519,7 +753,7 @@ static uint8_t *rasterize(Font *f, int size, const char *text, uint32_t color, i
       for (int i = 0; i < nItems; i++) {
          uint32_t code = items[i].code;
          if (code == '\n') { lineCount++; px = 0.0f; prev = 0; continue; }
-         float adv = getGlyphAdvance(f, code, fsize) + fontKern(f, prev, code);
+         float adv = getGlyphAdvance(f, code, fsize) + fontKern(f, prev, code, fsize);
          if (code == ' ') {
             float wordW = getWordWidth(f, items, nItems, i + 1, ' ', fsize);
             if (px + adv + wordW > (float)maxWidth && px > 0.0f) { lineCount++; px = 0.0f; prev = 0; continue; }
@@ -543,7 +777,7 @@ static uint8_t *rasterize(Font *f, int size, const char *text, uint32_t color, i
          for (int i = 0; i < nItems && li < lineCount; i++) {
             uint32_t code = items[i].code;
             if (code == '\n') { lineW[li++] = px; px = 0.0f; prev = 0; continue; }
-            float adv = getGlyphAdvance(f, code, fsize) + fontKern(f, prev, code);
+            float adv = getGlyphAdvance(f, code, fsize) + fontKern(f, prev, code, fsize);
             if (code == ' ') {
                float wordW = getWordWidth(f, items, nItems, i + 1, ' ', fsize);
                if (px + adv + wordW > (float)maxWidth && px > 0.0f) { lineW[li++] = px; px = 0.0f; prev = 0; continue; }
@@ -566,16 +800,8 @@ static uint8_t *rasterize(Font *f, int size, const char *text, uint32_t color, i
    if (!buf) { free(items); free(lineW); return NULL; }
    memset(buf, 0, bufSize);
 
-   CellFontRenderSurface surf;
-   cellFontRenderSurfaceInit(&surf, buf, surfW * 4, 4, surfW, surfH);
-   cellFontRenderSurfaceSetScissor(&surf, 0, 0, surfW, surfH);
-   cellFontSetupRenderScalePixel(&f->font, fsize, fsize);
-
-   // glyph effect state: italic via the slant shear (0.0 == genuinely no slant, safe to
-   // reset). Bold is synthetic emboldening at blit time (see blitGlyph) -- the renderer's
-   // weight effect is never touched, so tag-free text renders exactly like the default
-   // path and the shared font object is never perturbed (a weight reset once thinned all
-   // following text).
+   // Italic is a shear of the glyph bitmap (see shearGlyph). Bold is synthetic emboldening at blit time
+   // (see blitGlyph), so tag-free text renders exactly like the default path.
    //
    // The text is drawn in up to two passes: an optional SHADOW pass (every glyph in the
    // shadow colour, offset by sdx/sdy) and then the text pass composited over it -- the
@@ -586,19 +812,16 @@ static uint8_t *rasterize(Font *f, int size, const char *text, uint32_t color, i
    float ellipsisW = 0.0f;
    if (wrap == TEXT_NOWRAP_ELLIPSIS && maxWidth > 0) {
       for (int i = 0; i < 3; i++) ellipsisW += measureFontChar(f, size, '.');
-      cellFontSetScalePixel(&f->font, fsize, fsize);
-      cellFontSetupRenderScalePixel(&f->font, fsize, fsize);
    }
 
    for (int pass = hasShadow ? 0 : 1; pass < 2; pass++) {
       int shadowPass = (pass == 0);
       int bdx = shadowPass ? sdx : 0;
       int bdy = shadowPass ? sdy : 0;
-      int curItalic = 0;
       int lineIndex = 0;   // which wrapped line the pen is on (for the reveal map)
       float penX = 0.0f;   // line-relative pen (wrap/kern/advance all use this; offset added at draw)
       float lineOffX = getLineStartOffset(align, lineW, maxLineW, lineCount, 0);   // this line's draw offset
-      float penY = baseY;
+      float penY = baseY;   // top of the current line cell; the baseline sits baseY below it
       uint32_t prev = 0;   // previous glyph on this line (kerning context; resets per line)
 
       for (int i = 0; i < nItems; i++) {
@@ -610,7 +833,7 @@ static uint8_t *rasterize(Font *f, int size, const char *text, uint32_t color, i
             continue;
          }
 
-         float kern = fontKern(f, prev, code);
+         float kern = fontKern(f, prev, code, fsize);
          float advance = getGlyphAdvance(f, code, fsize) + kern;
 
          if (maxWidth > 0) {
@@ -627,16 +850,13 @@ static uint8_t *rasterize(Font *f, int size, const char *text, uint32_t color, i
                }
             } else if (wrap == TEXT_NOWRAP_ELLIPSIS) {
                if (penX + advance > (float)maxWidth - ellipsisW && i + 1 < nItems) {
-                  if (curItalic) {
-                     cellFontSetupRenderEffectSlant(&f->font, 0.0f); curItalic = 0;
-                     cellFontSetupRenderScalePixel(&f->font, fsize, fsize);
-                  }
+                  int baseline = (int)floorf(penY + baseY + 0.5f);
                   for (int d = 0; d < 3; d++) {
-                     CellFontImageTransInfo ti;
-                     CellFontGlyphMetrics dm;
-                     if (cellFontRenderCharGlyphImage(&f->font, '.', &surf, penX + lineOffX, penY, &dm, &ti) == CELL_OK) {
-                        blitGlyph(&ti, buf, surfW, surfH, bdx, bdy, shadowPass ? shadowArgb : color, 0);
-                        penX += dm.horizontal.advance;
+                     GlyphBitmap gb;
+                     if (rasterGlyph(f, '.', fsize, 0, penX + lineOffX, &gb) == 0) {
+                        blitGlyph(&gb, gb.ox + gb.x, baseline + gb.y, buf, surfW, surfH, bdx, bdy, shadowPass ? shadowArgb : color, 0);
+                        penX += gb.advance;
+                        free(gb.bitmap);
                      }
                   }
                   int endX = (int)(penX + lineOffX + 0.5f); if (endX > maxX) maxX = endX;
@@ -647,53 +867,45 @@ static uint8_t *rasterize(Font *f, int size, const char *text, uint32_t color, i
             }
          }
 
-         // apply italic slant only when it changes (bold is faux-bold at blit time)
-         int wantItalic = items[i].italic;
-         if (wantItalic != curItalic) {
-            cellFontSetupRenderEffectSlant(&f->font, wantItalic ? 0.35f : 0.0f); curItalic = wantItalic;
-            // some SDKs reset the render scale when an effect is set -- re-apply it
-            cellFontSetupRenderScalePixel(&f->font, fsize, fsize);
-         }
-
          penX += kern;   // kerning positions THIS glyph (already counted in `advance`)
 
-         CellFontImageTransInfo transInfo;
-         CellFontGlyphMetrics metrics;
-         int ret = cellFontRenderCharGlyphImage(&f->font, code, &surf, penX + lineOffX, penY, &metrics, &transInfo);
-         if (ret == CELL_OK) {
+         GlyphBitmap gb;
+         int ret = rasterGlyph(f, code, fsize, items[i].italic, penX + lineOffX, &gb);
+         if (ret == 0) {
             // synthetic-bold strength = pixel size / 10 (the FreeType convention; 0 at
             // tiny sizes = no embolden), and the pen advance widens by the same amount.
             int overhang = items[i].bold ? ((int)(fsize + 0.5f)) / 10 : 0;
-            blitGlyph(&transInfo, buf, surfW, surfH, bdx, bdy,
+            int gx = gb.ox + gb.x;
+            int gy = (int)floorf(penY + baseY + 0.5f) + gb.y;
+            blitGlyph(&gb, gx, gy, buf, surfW, surfH, bdx, bdy,
                       shadowPass ? shadowArgb : items[i].color, overhang);
-            penX += quantAdvance(f, metrics.horizontal.advance) + (float)overhang;
+            penX += quantAdvance(f, gb.advance) + (float)overhang;
             int endX = (int)(penX + lineOffX + 0.5f); if (endX > maxX) maxX = endX;
             if (!shadowPass) {
-               int goff = (int)((const uint8_t *)transInfo.surface - buf);
-               int gy = goff / transInfo.surfWidthByte;
-               if (gy < inkMinY) inkMinY = gy;                                   // union ink box
-               if (gy + transInfo.imageHeight > inkMaxY) inkMaxY = gy + transInfo.imageHeight;
+               if (gb.bitmap) {
+                  if (gy < inkMinY) inkMinY = gy;                                   // union ink box
+                  if (gy + gb.h > inkMaxY) inkMaxY = gy + gb.h;
+               }
                if (end) {
                   end->endX = endX;
                   end->endTop = gy;
-                  end->endBottom = gy + transInfo.imageHeight;
+                  end->endBottom = gy + gb.h;
                   // Line cell top = baseline - ascent. The glyph's ink top gy sits
-                  // bearingY below the baseline, so baseline = gy + bearingY, and the
+                  // bearingY above the baseline, so baseline = gy + bearingY, and the
                   // cell top (the top edge of the line box, where a caller top-aligns an
-                  // inline decoration) = gy + bearingY - baseLineY(ascent). Same units as gy.
-                  end->lineTop = gy + (int)(metrics.horizontal.bearingY + 0.5f) - (int)baseY;
+                  // inline decoration) = gy + bearingY - ascent. Same units as gy.
+                  end->lineTop = gb.bitmap ? gy + (int)(gb.bearingY + 0.5f) - (int)baseY
+                                           : (int)floorf(penY + 0.5f);
                   end->valid = 1;
                }
             }
+            free(gb.bitmap);
          } else {
             penX += fsize;
          }
          if (!shadowPass && reveal) recordRevealItem(reveal, i, penX, lineIndex);
          prev = code;
       }
-
-      // reset slant so the next pass / other render calls aren't left slanted
-      if (curItalic) cellFontSetupRenderEffectSlant(&f->font, 0.0f);
    }
 
    if (reveal) reveal->count = nItems < TEXT_REVEAL_MAX ? nItems : TEXT_REVEAL_MAX;
@@ -771,39 +983,20 @@ int renderGlyphTexture(Font *f, int size, uint32_t code, GfxTexture *out, int *o
 {
    if (!f->open || size <= 0) return -1;
 
-   cellFontSetScalePixel(&f->font, (float)size, (float)size);
-   cellFontBindRenderer(&f->font, &activeFontRenderer);
-   cellFontSetupRenderScalePixel(&f->font, (float)size, (float)size);
-
-   // a scratch surface with room around the glyph so the renderer never scissor-clips it; we read the
-   // glyph's own bitmap (transInfo.Image), not the surface, so its exact size only needs to fit here.
-   int surfDim = size * 3 + 8;
-   uint8_t *surfBuf = (uint8_t *)malloc((size_t)surfDim * surfDim * 4);
-   if (!surfBuf) return -1;
-   memset(surfBuf, 0, (size_t)surfDim * surfDim * 4);
-
-   CellFontRenderSurface surf;
-   cellFontRenderSurfaceInit(&surf, surfBuf, surfDim * 4, 4, surfDim, surfDim);
-   cellFontRenderSurfaceSetScissor(&surf, 0, 0, surfDim, surfDim);
-
-   CellFontGlyphMetrics metrics;
-   CellFontImageTransInfo transInfo;
-   int ret = cellFontRenderCharGlyphImage(&f->font, code, &surf, (float)size, (float)(size * 2), &metrics, &transInfo);
-   if (ret != CELL_OK) { free(surfBuf); return -1; }
-
-   int w = transInfo.imageWidth, h = transInfo.imageHeight;
-   if (w <= 0 || h <= 0) { free(surfBuf); return -1; }
+   GlyphBitmap gb;
+   if (rasterGlyph(f, code, (float)size, 0, 0.0f, &gb) != 0) return -1;
+   int w = gb.w, h = gb.h;
+   if (!gb.bitmap || w <= 0 || h <= 0) { free(gb.bitmap); return -1; }
 
    uint32_t *argb = (uint32_t *)malloc((size_t)w * h * 4);
-   if (!argb) { free(surfBuf); return -1; }
-   const uint8_t *coverage = (const uint8_t *)transInfo.image;
+   if (!argb) { free(gb.bitmap); return -1; }
    for (int y = 0; y < h; y++)
       for (int x = 0; x < w; x++)
-         argb[y * w + x] = ((uint32_t)coverage[y * transInfo.imageWidthByte + x] << 24) | 0x00FFFFFFu;
+         argb[y * w + x] = ((uint32_t)gb.bitmap[y * w + x] << 24) | 0x00FFFFFFu;
+   free(gb.bitmap);
 
    uint32_t offset = uploadGfxTexture(argb, w, h, w * 4);
    free(argb);
-   free(surfBuf);
    if (!offset) return -1;
 
    out->offset = offset;
@@ -813,8 +1006,8 @@ int renderGlyphTexture(Font *f, int size, uint32_t code, GfxTexture *out, int *o
 
    // where the ink sits inside the em box: ink top-left = (bearingX, ascent - bearingY) from the em top.
    int ascentPx = (f->unitsPerEm > 0) ? (int)ceilf((float)f->hheaAscent * (float)size / (float)f->unitsPerEm) : size;
-   if (offsetX) *offsetX = (int)(metrics.horizontal.bearingX + 0.5f);
-   if (offsetY) *offsetY = ascentPx - (int)(metrics.horizontal.bearingY + 0.5f);
+   if (offsetX) *offsetX = gb.x;
+   if (offsetY) *offsetY = ascentPx - (int)(gb.bearingY + 0.5f);
    return 0;
 }
 

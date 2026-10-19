@@ -10,9 +10,9 @@
 TEX R0.x, fragment.texcoord[0], texture[0], 2D;
 TEX R1.x, fragment.texcoord[0], texture[1], 2D;
 TEX R2.x, fragment.texcoord[0], texture[2], 2D;
-SUB R0.x, R0.x, c[0].x;
-SUB R1.x, R1.x, c[0].y;
-SUB R2.x, R2.x, c[0].z;
+ADD R0.x, R0.x, -c[0].x;
+ADD R1.x, R1.x, -c[0].y;
+ADD R2.x, R2.x, -c[0].z;
 MUL R3.x, R0.x, c[1].x;
 MAD R4.x, R2.x, c[2].x, R3.x;
 MAD R5.x, R1.x, c[3].x, R3.x;

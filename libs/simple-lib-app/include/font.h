@@ -1,8 +1,7 @@
 #pragma once
 
-// font - truetype font rendering via libfont/freetype
+// font - truetype font rendering (stb_truetype; no firmware font library is linked)
 
-#include <cell/font.h>
 #include <stdint.h>
 #include "gfx.h"
 
@@ -23,15 +22,16 @@ typedef enum {
    FONT_METRICS_GRID_CEIL     // advance = ceil(adv/grid)*grid + kerning floored to grid
 } FontMetricsMode;
 
+struct FontData;   // the face chain behind a Font (font.c)
+
 typedef struct {
-   CellFont font;
+   struct FontData *data;   // owned by the Font: closeFont releases it
    int      open;
-   void    *buffer;      // backing memory for openFontFile (cellFont keeps using it); NULL for system fonts
    int      metricsMode; // FontMetricsMode (default FONT_METRICS_NATIVE)
    float    metricsGrid; // grid in output px for FONT_METRICS_GRID_CEIL
-   // SFNT hhea/head metrics, parsed from the font file at open. Ren'Py's line height is the FreeType
-   // ascender - descender (hhea), NOT cellFont's OS/2-Windows-metric lineHeight (which over-spaces some
-   // OTF fonts). unitsPerEm == 0 => unavailable (system fonts) -> fall back to the cellFont layout.
+   // SFNT hhea/head metrics, parsed from the first face at open. The line height is the FreeType
+   // ascender - descender (hhea) the way Ren'Py computes it. unitsPerEm == 0 => unavailable -> the
+   // stb_truetype vertical metrics are used instead.
    int      unitsPerEm;
    int      hheaAscent;   // hhea.ascender  (font design units; positive)
    int      hheaDescent;  // hhea.descender (font design units; negative)

@@ -34,8 +34,8 @@ static uint64_t nowUs(void)
 
 // cellVdec resource tuning (from the SDK pamf_dmux sample): AVC uses 4 SPUs.
 #define VDEC_SPU_COUNT       4
-#define VDEC_PPU_PRIORITY    720
-#define VDEC_SPU_PRIORITY    200
+#define VDEC_PPU_PRIORITY    300
+#define VDEC_SPU_PRIORITY    100
 #define VDEC_PPU_STACK_SIZE  (16 * 1024)
 
 struct H264Decoder {
@@ -45,6 +45,7 @@ struct H264Decoder {
    sys_lwmutex_t  lock;
 
    int            auFedCount;     // AUs handed to cellVdecDecodeAu (decode thread only)
+   int            alternateSkipEnabled;
    volatile int   auDoneCount;     // incremented by the callback on each AUDONE
    volatile int   picPending;      // decoded pictures reported but not yet retrieved
    volatile int   seqDone;         // EndSeq finished (set by the callback, cleared by reset)
@@ -162,6 +163,14 @@ fail:
    return 0;
 }
 
+void setH264DecoderAlternateSkip(H264Decoder *decoder, int enabled)
+{
+   if (!decoder) return;
+   decoder->alternateSkipEnabled = enabled != 0;
+   if (decoder->alternateSkipEnabled)
+      logInfo("[decode-h264] alternating B_SKIP mode enabled\n");
+}
+
 int decodeAuH264(H264Decoder *decoder, const uint8_t *data, int size, uint64_t pts)
 {
    if (decoder->errored) return -1;
@@ -178,7 +187,10 @@ int decodeAuH264(H264Decoder *decoder, const uint8_t *data, int size, uint64_t p
    au.userData          = pts;                                // full-resolution pts, echoed on the pic item
    au.codecSpecificData = 0;
 
-   int ret = cellVdecDecodeAu(decoder->handle, CELL_VDEC_DEC_MODE_NORMAL, &au);
+   int mode = CELL_VDEC_DEC_MODE_NORMAL;
+   if (decoder->alternateSkipEnabled && (decoder->auFedCount & 1))
+      mode = CELL_VDEC_DEC_MODE_B_SKIP;
+   int ret = cellVdecDecodeAu(decoder->handle, mode, &au);
    if (ret == CELL_OK) { decoder->auFedCount++; return 0; }
    if (ret == (int)CELL_VDEC_ERROR_BUSY) return 1;   // queues full: pull pictures, then retry this AU
    logError("[decode-h264] DecodeAu failed 0x%x\n", ret);

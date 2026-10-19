@@ -33,7 +33,7 @@ export VPATH := $(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
 export DEPSDIR := $(CURDIR)/$(BUILD)
 export BUILDDIR := $(CURDIR)/$(BUILD)
 export OFILES := $(CFILES:.c=.o) $(addsuffix .o,$(VPOFILES)) $(addsuffix .o,$(FPOFILES))
-export INCLUDE := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) $(LIBPSL1GHT_INC) -I$(CURDIR)/$(BUILD)
+export INCLUDE := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) $(LIBPSL1GHT_INC) -I$(CURDIR)/$(BUILD) -I$(PS3DEV)/portlibs/ppu/include
 
 .PHONY: all $(BUILD) clean
 all: $(BUILD)

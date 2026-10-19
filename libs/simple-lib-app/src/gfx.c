@@ -322,7 +322,6 @@ int initGfx(GfxVsync vsync)
    }
 
    cellSysmoduleLoadModule(CELL_SYSMODULE_PNGDEC);
-   cellSysmoduleLoadModule(CELL_SYSMODULE_JPGDEC);
 
    // allocate host-side command buffer pool
    void *hostAddr = memalign(1024 * 1024, HOST_MEM_SIZE);
@@ -877,6 +876,7 @@ static void setYuvPlaneTexture(uint32_t unit, uint32_t offset, int width, int he
    tex.mipmap    = 1;
    tex.dimension = CELL_GCM_TEXTURE_DIMENSION_2;
    tex.cubemap   = CELL_GCM_FALSE;
+   // Match Mohasi's working RSX path: B8 planes are sampled through FROM_B.
    tex.remap     = CELL_GCM_REMAP_MODE(CELL_GCM_TEXTURE_REMAP_ORDER_XYXY, CELL_GCM_TEXTURE_REMAP_FROM_B, CELL_GCM_TEXTURE_REMAP_FROM_B, CELL_GCM_TEXTURE_REMAP_FROM_B, CELL_GCM_TEXTURE_REMAP_FROM_B, CELL_GCM_TEXTURE_REMAP_REMAP, CELL_GCM_TEXTURE_REMAP_REMAP, CELL_GCM_TEXTURE_REMAP_REMAP, CELL_GCM_TEXTURE_REMAP_REMAP);
    tex.width     = width;
    tex.height    = height;
