@@ -109,7 +109,7 @@ static void appendPage(VideoGrid *grid, const SearchResults *page)
 // are fetched lazily to this frontier instead of all at once, so returning to a category is cheap.
 static int thumbFrontier(const VideoGrid *grid)
 {
-   int frontier = (grid->scrollRow + grid->visibleRows + THUMB_LOOKAHEAD_ROWS) * GRID_COLS;
+   int frontier = (grid->scrollRow + grid->visibleRows + THUMB_LOOKAHEAD_ROWS) * grid->columns;
    if (frontier > grid->results.count) frontier = grid->results.count;
    return frontier;
 }
@@ -269,8 +269,8 @@ static void dematerializeTile(VideoGrid *grid, int i)
 // MARGIN_ROWS-wide window wasn't drawn last frame (the grid draws only the inner visible rows).
 static void reconcileWindow(VideoGrid *grid)
 {
-   int start = (grid->scrollRow - MARGIN_ROWS) * GRID_COLS;
-   int end   = (grid->scrollRow + grid->visibleRows + MARGIN_ROWS) * GRID_COLS;
+   int start = (grid->scrollRow - MARGIN_ROWS) * grid->columns;
+   int end   = (grid->scrollRow + grid->visibleRows + MARGIN_ROWS) * grid->columns;
    if (start < 0) start = 0;
    if (end > grid->results.count) end = grid->results.count;
    if (start == grid->winStart && end == grid->winEnd) return;
@@ -297,7 +297,7 @@ static void decodeWindowThumbnails(VideoGrid *grid)
       int i = grid->decodeIndex;
       grid->decodeIndex = -1;
       if (i >= 0 && i < grid->results.count && grid->thumbs[i].state == THUMB_DECODING) {
-         int row = i / GRID_COLS;
+         int row = i / grid->columns;
          int visible = row >= grid->scrollRow && row < grid->scrollRow + grid->visibleRows;
          if (rc > 0 && visible) {
             grid->thumbs[i].tex = uploadImageBuffer(&decoded);
@@ -319,7 +319,7 @@ static void decodeWindowThumbnails(VideoGrid *grid)
    }
 
    for (int i = grid->winStart; i < grid->winEnd; i++) {
-      int row = i / GRID_COLS;
+      int row = i / grid->columns;
       if (row < grid->scrollRow || row >= grid->scrollRow + grid->visibleRows) continue;
       if (grid->thumbs[i].state != THUMB_FETCHED || !grid->thumbs[i].jpeg || grid->thumbs[i].tex.offset) continue;
       if (requestImageMemAsync(grid->thumbs[i].jpeg, (uint32_t)grid->thumbs[i].jpegLen) == 0) {
@@ -349,17 +349,39 @@ void initVideoGrid(VideoGrid *grid, Font *font, int x, int y, int width, int hei
    grid->decodeIndex = -1;
    grid->font = font;
    grid->x = x; grid->y = y; grid->width = width; grid->height = height;
+   int sdOutput = isGfxSdVideoOutput();
+   grid->columns = sdOutput ? 3 : GRID_COLS_WIDE;
+   grid->gap = sdOutput ? 10 : GRID_GAP;
+   // Reserve enough text space for the biggest 2.0x preset. This keeps grid
+   // coordinates and thumbnail size fixed when L2 changes font size.
+   grid->titleSize = sdOutput ? 15 : ROW_TITLE;
+   grid->metaSize = sdOutput ? 11 : META_SIZE;
+   grid->tileTextH = sdOutput
+      ? 6 + grid->titleSize * 2 + 6 + grid->metaSize * 2 + 4
+      : TILE_TEXT_H;
+   grid->metaOffset = sdOutput ? grid->titleSize * 2 + 6 : ROW_TITLE + 8;
 
-   grid->tileW       = (width - (GRID_COLS - 1) * GRID_GAP) / GRID_COLS;
-   grid->thumbH      = grid->tileW * 9 / 16;
-   grid->rowStep     = grid->thumbH + TILE_TEXT_H + GRID_GAP;
+   int maxTileW = (width - (grid->columns - 1) * grid->gap) / grid->columns;
+   // In either 4:3 or 16:9 SD output, cap tile width so three complete rows fit.
+   if (sdOutput) {
+      int maxStep = height / 3;
+      int maxThumbH = maxStep - grid->tileTextH - grid->gap;
+      int widthFromHeight = maxThumbH > 0 ? maxThumbH * 16 / 9 : 1;
+      if (maxTileW > widthFromHeight) maxTileW = widthFromHeight;
+   }
+   if (maxTileW < 1) maxTileW = 1;
+   grid->tileW = maxTileW;
+   grid->thumbH = grid->tileW * 9 / 16;
+   grid->rowStep = grid->thumbH + grid->tileTextH + grid->gap;
    grid->visibleRows = height / grid->rowStep;
    if (grid->visibleRows < 1) grid->visibleRows = 1;
+   int usedWidth = grid->columns * grid->tileW + (grid->columns - 1) * grid->gap;
+   grid->x = x + (width - usedWidth) / 2;
 
    for (int i = 0; i < MAX_SEARCH_RESULTS; i++) {
-      initLabel(&grid->rows[i],      font, 0, 0, grid->tileW, AUTO, ROW_TITLE, activeTheme->textPrimary,   TEXT_NOWRAP_ELLIPSIS, "");
-      initLabel(&grid->metas[i],     font, 0, 0, grid->tileW, AUTO, META_SIZE, activeTheme->textSecondary, TEXT_NOWRAP_ELLIPSIS, "");
-      initLabel(&grid->durations[i], font, 0, 0, AUTO,        AUTO, DUR_SIZE,  activeTheme->textPrimary,   TEXT_NOWRAP,          "");
+      initLabel(&grid->rows[i],      font, 0, 0, grid->tileW, AUTO, grid->titleSize, activeTheme->textPrimary,   TEXT_NOWRAP_ELLIPSIS, "");
+      initLabel(&grid->metas[i],     font, 0, 0, grid->tileW, AUTO, grid->metaSize, activeTheme->textSecondary, TEXT_NOWRAP_ELLIPSIS, "");
+      initLabel(&grid->durations[i], font, 0, 0, AUTO,        AUTO, DUR_SIZE,       activeTheme->textPrimary,   TEXT_NOWRAP,          "");
    }
    initLabel(&grid->watchLaterBadge, font, 0, 0, AUTO, AUTO, WATCHLATER_BADGE_SIZE, activeTheme->textPrimary, TEXT_NOWRAP, "Watch Later");
 }
@@ -412,10 +434,10 @@ void updateVideoGrid(VideoGrid *grid)
 
    if      (isRepeatDue(&grid->horizontalRepeat, getPadButtonState(PAD_BTN_RIGHT))) moveSelection(grid, 1);
    else if (isRepeatDue(&grid->horizontalRepeat, getPadButtonState(PAD_BTN_LEFT)))  moveSelection(grid, -1);
-   if      (isRepeatDue(&grid->verticalRepeat,   getPadButtonState(PAD_BTN_DOWN)))  moveSelection(grid, GRID_COLS);
-   else if (isRepeatDue(&grid->verticalRepeat,   getPadButtonState(PAD_BTN_UP)))    moveSelection(grid, -GRID_COLS);
+   if      (isRepeatDue(&grid->verticalRepeat,   getPadButtonState(PAD_BTN_DOWN)))  moveSelection(grid, grid->columns);
+   else if (isRepeatDue(&grid->verticalRepeat,   getPadButtonState(PAD_BTN_UP)))    moveSelection(grid, -grid->columns);
 
-   int selRow = grid->selected / GRID_COLS;
+   int selRow = grid->selected / grid->columns;
    if (selRow < grid->scrollRow)                            grid->scrollRow = selRow;
    else if (selRow >= grid->scrollRow + grid->visibleRows)  grid->scrollRow = selRow - grid->visibleRows + 1;
 
@@ -424,7 +446,7 @@ void updateVideoGrid(VideoGrid *grid)
       if (grid->thumbFetched < thumbFrontier(grid)) {
          loadThumbnails(grid);
       } else if (grid->results.continuation[0] && grid->results.count < MAX_SEARCH_RESULTS) {
-         int lastRow = (grid->results.count - 1) / GRID_COLS;
+         int lastRow = (grid->results.count - 1) / grid->columns;
          if (selRow >= lastRow - 1) loadMore(grid);
       }
    }
@@ -432,8 +454,8 @@ void updateVideoGrid(VideoGrid *grid)
 
 static void drawTile(VideoGrid *grid, int i)
 {
-   int row = i / GRID_COLS, col = i % GRID_COLS;
-   int tx = grid->x + col * (grid->tileW + GRID_GAP);
+   int row = i / grid->columns, col = i % grid->columns;
+   int tx = grid->x + col * (grid->tileW + grid->gap);
    int ty = grid->y + (row - grid->scrollRow) * grid->rowStep;
    const SearchResult *item = &grid->results.items[i];
    int watched = grid->isWatched && grid->isWatched(item->videoId);
@@ -448,30 +470,36 @@ static void drawTile(VideoGrid *grid, int i)
    else
       fillGfxRectangle(tx, ty, grid->tileW, grid->thumbH, activeTheme->surface);
 
+   float uiScale = getGfxUiScaleFactor();
+   int padX = (int)(6.0f * uiScale + 0.5f);
+   int padY = (int)(4.0f * uiScale + 0.5f);
+   int edgeGap = (int)(6.0f * uiScale + 0.5f);
    if (item->duration[0] || item->isLive) {
-      int badgeW = grid->durations[i].tt.tex.w + 12, badgeH = DUR_SIZE + 8;
-      int badgeX = tx + grid->tileW - badgeW - 6, badgeY = ty + grid->thumbH - badgeH - 6;
+      int badgeW = grid->durations[i].tt.tex.w + 2 * padX;
+      int badgeH = grid->durations[i].tt.tex.h + 2 * padY;
+      int badgeX = tx + grid->tileW - badgeW - edgeGap, badgeY = ty + grid->thumbH - badgeH - edgeGap;
       fillGfxRectangle(badgeX, badgeY, badgeW, badgeH, item->isLive ? activeTheme->accent : activeTheme->badgeFill);
-      drawLabelAt(&grid->durations[i], badgeX + 6, badgeY + 4);
+      drawLabelAt(&grid->durations[i], badgeX + padX, badgeY + padY);
    }
 
    if (grid->isWatchLater && grid->isWatchLater(item->videoId)) {
-      int badgeW = grid->watchLaterBadge.tt.tex.w + 12, badgeH = WATCHLATER_BADGE_SIZE + 8;
-      int badgeX = tx + grid->tileW - badgeW - 6, badgeY = ty + 6;
+      int badgeW = grid->watchLaterBadge.tt.tex.w + 2 * padX;
+      int badgeH = grid->watchLaterBadge.tt.tex.h + 2 * padY;
+      int badgeX = tx + grid->tileW - badgeW - edgeGap, badgeY = ty + 6;
       fillGfxRectangle(badgeX, badgeY, badgeW, badgeH, activeTheme->badgeFill);
-      drawLabelAt(&grid->watchLaterBadge, badgeX + 6, badgeY + 4);
+      drawLabelAt(&grid->watchLaterBadge, badgeX + padX, badgeY + padY);
    }
 
    int textY = ty + grid->thumbH + 6, alpha = watched ? WATCHED_ALPHA : 255;
-   moveLabel(&grid->rows[i],  tx, textY);                   drawLabelAlpha(&grid->rows[i],  alpha);
-   moveLabel(&grid->metas[i], tx, textY + ROW_TITLE + 8);   drawLabelAlpha(&grid->metas[i], alpha);
+   moveLabel(&grid->rows[i],  tx, textY);                    drawLabelAlpha(&grid->rows[i],  alpha);
+   moveLabel(&grid->metas[i], tx, textY + grid->metaOffset); drawLabelAlpha(&grid->metas[i], alpha);
 }
 
 void drawVideoGrid(VideoGrid *grid)
 {
    if (grid->stage != GRID_READY) return;
    for (int i = 0; i < grid->results.count; i++) {
-      int row = i / GRID_COLS;
+      int row = i / grid->columns;
       if (row >= grid->scrollRow && row < grid->scrollRow + grid->visibleRows) drawTile(grid, i);
    }
 }
