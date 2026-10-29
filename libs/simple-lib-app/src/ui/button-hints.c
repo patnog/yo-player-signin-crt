@@ -57,6 +57,12 @@ void setButtonHintGap(ButtonHints *bar, int gap)
    bar->gap = gap;
 }
 
+void setButtonHintsStableLayout(ButtonHints *bar, int enabled)
+{
+   if (bar)
+      bar->stableLayout = enabled != 0;
+}
+
 void setButtonHintShown(ButtonHints *bar, int index, int shown)
 {
    if (index < 0 || index >= bar->count) return;
