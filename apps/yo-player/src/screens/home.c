@@ -27,7 +27,14 @@
 #define HEADER_Y      54
 #define TITLE_SIZE    30
 #define GRID_TOP      100
-#define HINTS_BOTTOM  88        // hint-row top offset from the screen bottom (overlaid, no layout shift)
+#define HINTS_BOTTOM     88       // standard single-row hint top offset from the screen bottom
+#define SD_HINTS_BOTTOM 100       // lower hint-row top offset; keeps 2.0x glyphs inside TV safe area
+#define SD_HINT_ROW_GAP   8
+#define GRID_BOTTOM_GAP  24
+#define SD_GRID_BOTTOM_GAP 20
+#define SD_MAX_SCALE    2.0f
+#define SD_HEADER_Y      54
+#define SD_GRID_TOP     132
 #define HINT_GLYPH_H  28
 #define HINT_TEXT     22
 
@@ -65,16 +72,18 @@ static struct {
 
 static Font        uiFont;
 static Label       titleLabel, statusLabel;
-static ButtonHints hints;
+static ButtonHints hints, hintsSecondRow;
 static int         accountHint;   // index of the Select hint ("Sign in" / "Account")
+static int         scaleHint = -1;
+static int         sdHintsTwoRows;
 
 // L2 cycles through these SD-only scales. The value is saved separately from
 // settings.txt so the homebrew can update it without rewriting user settings.
 #define SD_SCALE_PATH "/dev_hdd0/tmp/yo-player/sd-ui-scale.txt"
-static const float SdScaleChoices[] = { 1.00f, 1.05f, 1.10f, 1.15f, 1.20f, 1.25f };
+static const float SdScaleChoices[] = { 1.00f, 1.50f, 2.00f };
 #define SD_SCALE_COUNT ((int)(sizeof SdScaleChoices / sizeof SdScaleChoices[0]))
 static int sdScaleLoaded;
-static int sdScaleIndex = 3; // 1.15x on first launch
+static int sdScaleIndex = 1; // default 1.5x on first launch
 
 static void loadSdScale(void)
 {
@@ -104,6 +113,20 @@ static void cycleSdScale(void)
    int n = snprintf(buf, sizeof buf, "%.2f\n", (double)SdScaleChoices[sdScaleIndex]);
    if (n > 0) writeFile(SD_SCALE_PATH, buf, (uint64_t)n);
 }
+
+static void refreshScaleHint(void)
+{
+   if (!sdHintsTwoRows || scaleHint < 0) return;
+   char caption[32];
+   snprintf(caption, sizeof caption, "Scale %.1fx", (double)getGfxSdUiScale());
+   setButtonHintCaption(&hintsSecondRow, scaleHint, caption);
+}
+
+static void setAccountHintCaption(const char *caption)
+{
+   setButtonHintCaption(sdHintsTwoRows ? &hintsSecondRow : &hints, accountHint, caption);
+}
+
 
 // the account panel
 static Label       panelTitle, panelLine1, panelLine2, panelCode, panelFooter;
@@ -225,7 +248,7 @@ static void applyAccountChange(void)
 {
    accountRevisionSeen = getAccountRevision();
    for (int feed = 0; feed < ACCOUNT_FEED_COUNT; feed++) categoryCached[HOME_ACCOUNT + feed] = 0;
-   setButtonHintCaption(&hints, accountHint, isSignedIn() ? "Account" : "Sign in");
+   setAccountHintCaption(isSignedIn() ? "Account" : "Sign in");
    home.category = isSignedIn() ? HOME_ACCOUNT + ACCOUNT_FEED_HOME : HOME_SUBS;
    loadCategory();
 }
@@ -329,22 +352,47 @@ static void initHome(void)
    loadSdScale();
    home.screenW = getGfxScreenWidth();
    home.screenH = getGfxScreenHeight();
+   sdHintsTwoRows = isGfxSdVideoOutput();
+   int headerY = sdHintsTwoRows ? SD_HEADER_Y : HEADER_Y;
+   int gridTop = sdHintsTwoRows ? SD_GRID_TOP : GRID_TOP;
 
    uiFont = openSystemFont(FONT_POP);
-   initLabel(&titleLabel,  &uiFont, MARGIN_X, HEADER_Y, home.screenW - 2 * MARGIN_X, AUTO, TITLE_SIZE, activeTheme->textPrimary, TEXT_NOWRAP_ELLIPSIS, "");
-   initLabel(&statusLabel, &uiFont, MARGIN_X, GRID_TOP, home.screenW - 2 * MARGIN_X, AUTO, 21, activeTheme->textSecondary, TEXT_NOWRAP, "Loading...");
+   initLabel(&titleLabel,  &uiFont, MARGIN_X, headerY, home.screenW - 2 * MARGIN_X, AUTO, TITLE_SIZE, activeTheme->textPrimary, TEXT_NOWRAP_ELLIPSIS, "");
+   initLabel(&statusLabel, &uiFont, MARGIN_X, gridTop, home.screenW - 2 * MARGIN_X, AUTO, 21, activeTheme->textSecondary, TEXT_NOWRAP, "Loading...");
 
-   initButtonHints(&hints, &uiFont, home.screenH - HINTS_BOTTOM, HINT_GLYPH_H, HINT_TEXT, activeTheme->textSecondary);
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_CROSS),    "Play");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_SQUARE),   "Watch Later");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_TRIANGLE), "Channel");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_R3),       "Download");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_START),    "Search");
-   accountHint = addButtonHint(&hints, getConsoleGlyph(GLYPH_SELECT), isSignedIn() ? "Account" : "Sign in");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_L1),       "");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_R1),       "Category");
-   if (isGfxSdVideoOutput())
-      addButtonHint(&hints, getConsoleGlyph(GLYPH_L2),    "UI Scale");
+   if (sdHintsTwoRows) {
+      // Reserve the maximum row height so pressing L2 only changes text/icon size,
+      // not the absolute positions of the footer or grid.
+      int maxGlyphHeight = (int)(HINT_GLYPH_H * SD_MAX_SCALE + 0.5f);
+      initButtonHints(&hints, &uiFont,
+                      home.screenH - SD_HINTS_BOTTOM - maxGlyphHeight - SD_HINT_ROW_GAP,
+                      HINT_GLYPH_H, HINT_TEXT, activeTheme->textSecondary);
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_CROSS),    "Play");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_SQUARE),   "Watch Later");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_TRIANGLE), "Channel");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_R3),       "Download");
+      setButtonHintsStableLayout(&hints, 1);
+
+      initButtonHints(&hintsSecondRow, &uiFont, home.screenH - SD_HINTS_BOTTOM,
+                      HINT_GLYPH_H, HINT_TEXT, activeTheme->textSecondary);
+      addButtonHint(&hintsSecondRow, getConsoleGlyph(GLYPH_START), "Search");
+      accountHint = addButtonHint(&hintsSecondRow, getConsoleGlyph(GLYPH_SELECT), isSignedIn() ? "Account" : "Sign in");
+      addButtonHint(&hintsSecondRow, getConsoleGlyph(GLYPH_L1), "");
+      addButtonHint(&hintsSecondRow, getConsoleGlyph(GLYPH_R1), "Category");
+      scaleHint = addButtonHint(&hintsSecondRow, getConsoleGlyph(GLYPH_L2), "Scale 1.5x");
+      setButtonHintsStableLayout(&hintsSecondRow, 1);
+      refreshScaleHint();
+   } else {
+      initButtonHints(&hints, &uiFont, home.screenH - HINTS_BOTTOM, HINT_GLYPH_H, HINT_TEXT, activeTheme->textSecondary);
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_CROSS),    "Play");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_SQUARE),   "Watch Later");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_TRIANGLE), "Channel");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_R3),       "Download");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_START),    "Search");
+      accountHint = addButtonHint(&hints, getConsoleGlyph(GLYPH_SELECT), isSignedIn() ? "Account" : "Sign in");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_L1),       "");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_R1),       "Category");
+   }
 
    int panelY = (home.screenH - PANEL_H) / 2;
    initLabel(&panelTitle,  &uiFont, 0, 0, PANEL_W, AUTO, 30, activeTheme->textPrimary,   TEXT_NOWRAP, "");
@@ -356,7 +404,14 @@ static void initHome(void)
    panelConfirmHint = addButtonHint(&panelHints, getConsoleGlyph(GLYPH_CROSS),  "Try again");
    panelBackHint    = addButtonHint(&panelHints, getConsoleGlyph(GLYPH_CIRCLE), "Close");
 
-   initVideoGrid(&home.grid, &uiFont, MARGIN_X, GRID_TOP, home.screenW - 2 * MARGIN_X, home.screenH - GRID_TOP - HINTS_BOTTOM - HINT_GLYPH_H - 24);
+   int gridHeight;
+   if (sdHintsTwoRows) {
+      int maxGlyphHeight = (int)(HINT_GLYPH_H * SD_MAX_SCALE + 0.5f);
+      gridHeight = home.screenH - gridTop - SD_HINTS_BOTTOM - maxGlyphHeight - SD_HINT_ROW_GAP - SD_GRID_BOTTOM_GAP;
+   } else {
+      gridHeight = home.screenH - gridTop - HINTS_BOTTOM - HINT_GLYPH_H - GRID_BOTTOM_GAP;
+   }
+   initVideoGrid(&home.grid, &uiFont, MARGIN_X, gridTop, home.screenW - 2 * MARGIN_X, gridHeight);
    setGridWatchedPredicate(&home.grid, isWatched);
    setGridWatchLaterPredicate(&home.grid, isWatchLater);
 
@@ -377,7 +432,11 @@ static void updateHome(void)
    if (oskInputActive()) return;
 
    // Cycle and persist the SD readability scale; thumbnails keep their size.
-   if (isPadButtonPressed(PAD_BTN_L2) && isGfxSdVideoOutput()) { cycleSdScale(); return; }
+   if (isPadButtonPressed(PAD_BTN_L2) && isGfxSdVideoOutput()) {
+      cycleSdScale();
+      refreshScaleHint();
+      return;
+   }
 
    if (isPadButtonPressed(PAD_BTN_START)) oskInputBegin("Search YouTube", "", onQueryEntered);
    if (isPadButtonPressed(PAD_BTN_SELECT)) { openAccountPanel(); return; }
@@ -419,6 +478,7 @@ static void drawHome(void)
       drawLabel(&statusLabel);
    }
    drawButtonHints(&hints, home.screenW);
+   if (sdHintsTwoRows) drawButtonHints(&hintsSecondRow, home.screenW);
    drawDownloadOverlay(home.screenW);
    if (home.accountOpen) drawAccountPanel();
 }
@@ -448,6 +508,7 @@ static void termHome(void)
 {
    termVideoGrid(&home.grid);
    termButtonHints(&hints);
+   termButtonHints(&hintsSecondRow);
    termButtonHints(&panelHints);
    freeLabel(&titleLabel);
    freeLabel(&statusLabel);
