@@ -5,6 +5,7 @@
 #include "screens/play.h"
 #include "video-grid.h"
 #include "storage.h"
+#include "vfs.h"
 #include "account.h"
 #include "downloads.h"
 #include "ui/button-hints.h"
@@ -66,6 +67,43 @@ static Font        uiFont;
 static Label       titleLabel, statusLabel;
 static ButtonHints hints;
 static int         accountHint;   // index of the Select hint ("Sign in" / "Account")
+
+// L2 cycles through these SD-only scales. The value is saved separately from
+// settings.txt so the homebrew can update it without rewriting user settings.
+#define SD_SCALE_PATH "/dev_hdd0/tmp/yo-player/sd-ui-scale.txt"
+static const float SdScaleChoices[] = { 1.00f, 1.05f, 1.10f, 1.15f, 1.20f, 1.25f };
+#define SD_SCALE_COUNT ((int)(sizeof SdScaleChoices / sizeof SdScaleChoices[0]))
+static int sdScaleLoaded;
+static int sdScaleIndex = 3; // 1.15x on first launch
+
+static void loadSdScale(void)
+{
+   if (sdScaleLoaded) return;
+   sdScaleLoaded = 1;
+   char buf[32];
+   int n = readFile(SD_SCALE_PATH, buf, sizeof buf - 1);
+   if (n > 0) {
+      buf[n] = 0;
+      float saved = 0.0f;
+      if (sscanf(buf, "%f", &saved) == 1) {
+         for (int i = 0; i < SD_SCALE_COUNT; i++) {
+            float diff = saved - SdScaleChoices[i];
+            if (diff > -0.001f && diff < 0.001f) { sdScaleIndex = i; break; }
+         }
+      }
+   }
+   setGfxSdUiScale(SdScaleChoices[sdScaleIndex]);
+}
+
+static void cycleSdScale(void)
+{
+   if (!isGfxSdVideoOutput()) return;
+   sdScaleIndex = (sdScaleIndex + 1) % SD_SCALE_COUNT;
+   setGfxSdUiScale(SdScaleChoices[sdScaleIndex]);
+   char buf[32];
+   int n = snprintf(buf, sizeof buf, "%.2f\n", (double)SdScaleChoices[sdScaleIndex]);
+   if (n > 0) writeFile(SD_SCALE_PATH, buf, (uint64_t)n);
+}
 
 // the account panel
 static Label       panelTitle, panelLine1, panelLine2, panelCode, panelFooter;
@@ -288,6 +326,7 @@ static void onQueryEntered(const char *text)
 
 static void initHome(void)
 {
+   loadSdScale();
    home.screenW = getGfxScreenWidth();
    home.screenH = getGfxScreenHeight();
 
@@ -304,6 +343,8 @@ static void initHome(void)
    accountHint = addButtonHint(&hints, getConsoleGlyph(GLYPH_SELECT), isSignedIn() ? "Account" : "Sign in");
    addButtonHint(&hints, getConsoleGlyph(GLYPH_L1),       "");
    addButtonHint(&hints, getConsoleGlyph(GLYPH_R1),       "Category");
+   if (isGfxSdVideoOutput())
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_L2),    "UI Scale");
 
    int panelY = (home.screenH - PANEL_H) / 2;
    initLabel(&panelTitle,  &uiFont, 0, 0, PANEL_W, AUTO, 30, activeTheme->textPrimary,   TEXT_NOWRAP, "");
@@ -334,6 +375,9 @@ static void updateHome(void)
    if (getAccountRevision() != accountRevisionSeen) applyAccountChange();
    if (home.accountOpen) { updateAccountPanel(); return; }
    if (oskInputActive()) return;
+
+   // Cycle and persist the SD readability scale; thumbnails keep their size.
+   if (isPadButtonPressed(PAD_BTN_L2) && isGfxSdVideoOutput()) { cycleSdScale(); return; }
 
    if (isPadButtonPressed(PAD_BTN_START)) oskInputBegin("Search YouTube", "", onQueryEntered);
    if (isPadButtonPressed(PAD_BTN_SELECT)) { openAccountPanel(); return; }
