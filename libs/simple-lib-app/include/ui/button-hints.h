@@ -27,6 +27,7 @@ typedef struct {
    uint32_t captionColor;
    ButtonHint hints[MAX_BUTTON_HINTS];
    int      count;
+   int      stableLayout;   // keep each hint's anchor fixed at the maximum SD scale
 } ButtonHints;
 
 void initButtonHints(ButtonHints *bar, Font *font, int y, int glyphHeight, int captionSize, uint32_t captionColor);
@@ -37,6 +38,7 @@ void setButtonHintCaption(ButtonHints *bar, int index, const char *caption);
 // leave a hint out of the row, for a button that does nothing on what is picked right now
 void setButtonHintShown(ButtonHints *bar, int index, int shown);
 void setButtonHintGap(ButtonHints *bar, int gap);   // wider or tighter spacing than the usual
+void setButtonHintsStableLayout(ButtonHints *bar, int enabled); // do not move hint anchors when font scale changes
 void drawButtonHints(ButtonHints *bar, int screenWidth);
 // the same row starting at x rather than centred
 void drawButtonHintsAt(ButtonHints *bar, int x);
