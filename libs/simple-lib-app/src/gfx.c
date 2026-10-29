@@ -358,7 +358,7 @@ int initGfx(GfxVsync vsync)
       virtualW = VIRTUAL_W_4_3;
    } else {
       // Treat 16:9 and AUTO/unknown configurations as widescreen by default.
-      virtualW = VIRTUAL_W_WIDE
+      virtualW = VIRTUAL_W_WIDE;
    }
 
    framePitch = cellGcmGetTiledPitchSize(cellGcmAlign(CELL_GCM_ZCULL_ALIGN_WIDTH, screenW) * BYTES_PER_PIXEL);
