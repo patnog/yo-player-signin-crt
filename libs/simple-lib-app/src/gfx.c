@@ -354,7 +354,7 @@ int initGfx(GfxVsync vsync)
 
    // Use the configured display aspect, not the framebuffer's pixel ratio:
    // SD modes can be 720x480 for either 4:3 or anamorphic 16:9 output.
-   if (videoState.displayMode.aspect == CELL_VIDEO_OUT_ASPECT_4_3) {
+   if (videoState.displayMode.aspect == VIDEO_ASPECT_4_3) {
       virtualW = VIRTUAL_W_4_3;
    } else {
       // Treat 16:9 and AUTO/unknown configurations as widescreen by default.
