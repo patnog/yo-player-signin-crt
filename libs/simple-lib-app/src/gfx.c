@@ -14,6 +14,7 @@
 #include <cell/codec/pngdec.h>
 #include <cell/sysmodule.h>
 #include <sysutil/sysutil_sysparam.h>
+#include <malloc.h>
 
 #ifdef PSL1GHT
 static gcmContextData *pslGcmContext;
