@@ -17,6 +17,7 @@ typedef struct {
    uint32_t color;
    TextWrap wrap;
    int raw;   // skip {i}/{b}/{color=} style-tag parsing - see initLabelRaw
+   float renderedScale; // font-scale factor used to build tt; refreshed on draw after L2 changes
    char text[LABEL_MAX_TEXT];
 } Label;
 
@@ -28,6 +29,7 @@ void initLabel(Label *l, Font *font, int x, int y, int width, int height, int si
 void initLabelRaw(Label *l, Font *font, int x, int y, int width, int height, int size, uint32_t color, TextWrap wrap, const char *text);
 
 void setLabelText(Label *l, const char *text);
+void refreshLabelScale(Label *l);
 
 // re-renders the label in a new colour (for a live theme switch). a no-op when the colour is
 // unchanged; otherwise re-rasterises the current text so the change shows without new text.
