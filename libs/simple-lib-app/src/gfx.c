@@ -50,12 +50,12 @@ typedef struct {
    float u, v;
 } GfxVertex;
 
-// Apps always draw on a virtual 1920x1080 canvas regardless of the TV's real resolution.
-// The clip-space conversion divides by the virtual size while the viewport is the real
-// surface, so the GPU scales everything down (720p, 576p, 480p) for free. On a 1080p
-// screen virtual == physical and nothing changes.
-#define VIRTUAL_W 1920
-#define VIRTUAL_H 1080
+// Apps draw on a virtual canvas whose aspect ratio follows the active PS3 video output:
+// 1920x1080 for 16:9, 1440x1080 for 4:3. The GPU scales it to the real framebuffer.
+#define VIRTUAL_W_WIDE 1920
+#define VIRTUAL_W_4_3  1440
+#define VIRTUAL_H      1080
+static int       virtualW = VIRTUAL_W_WIDE;
 
 static int       initialized = 0;
 static int       screenW = 0;        // display buffer dimensions (the flipped surface, real pixels)
@@ -309,7 +309,7 @@ static void setSurface(uint32_t offset, uint32_t pitch, int w, int h, int logica
 
 static void setRenderTarget(void)
 {
-   setSurface(frameOffset[backBuffer], framePitch, screenW, screenH, VIRTUAL_W, VIRTUAL_H);
+   setSurface(frameOffset[backBuffer], framePitch, screenW, screenH, virtualW, VIRTUAL_H);
    targetIsDisplay = 1;
 }
 
@@ -351,6 +351,16 @@ int initGfx(GfxVsync vsync)
 
    screenW = res.width;
    screenH = res.height;
+
+   // Use the configured display aspect, not the framebuffer's pixel ratio:
+   // SD modes can be 720x480 for either 4:3 or anamorphic 16:9 output.
+   if (videoState.displayMode.aspect == CELL_VIDEO_OUT_ASPECT_4_3) {
+      virtualW = VIRTUAL_W_4_3;
+   } else {
+      // Treat 16:9 and AUTO/unknown configurations as widescreen by default.
+      virtualW = VIRTUAL_W_WIDE
+   }
+
    framePitch = cellGcmGetTiledPitchSize(cellGcmAlign(CELL_GCM_ZCULL_ALIGN_WIDTH, screenW) * BYTES_PER_PIXEL);
 
    // configure video output
@@ -498,7 +508,7 @@ int initGfx(GfxVsync vsync)
       cellGcmAddressToOffset(&batchVerts[i][0].u, &batchUvOffset[i]);
    }
 
-   logInfo("[gfx] ready: %d x %d (virtual %d x %d), pitch=%u, vram_used=%zu/%zu\n", screenW, screenH, VIRTUAL_W, VIRTUAL_H, framePitch, getUsedVram(), vramSize);
+   logInfo("[gfx] ready: %d x %d (virtual %d x %d), pitch=%u, vram_used=%zu/%zu\n", screenW, screenH, virtualW, VIRTUAL_H, framePitch, getUsedVram(), vramSize);
    return 0;
 }
 
@@ -808,7 +818,7 @@ void drawGfxTexture(int x, int y, int w, int h, GfxTexture tex, float u0, float 
    // nearest is crisp only at 1:1. on a sub-1080p screen every draw is shrunk from the virtual
    // canvas, so force smooth filtering there or text and sprites go blocky. offscreen targets
    // stay 1:1 (their logical size is their real size) and keep the caller's choice.
-   if (filter == GFX_FILTER_NEAREST && targetIsDisplay && screenW != VIRTUAL_W)
+   if (filter == GFX_FILTER_NEAREST && targetIsDisplay && screenW != virtualW)
       filter = GFX_FILTER_LINEAR;
 
    // flush if texture or filter mode changes
@@ -975,7 +985,7 @@ void finishGfx(void)
 }
 
 // virtual canvas size, not the TV's real resolution -- all layout happens in this space
-int getGfxScreenWidth(void)  { return VIRTUAL_W; }
+int getGfxScreenWidth(void)  { return virtualW; }
 int getGfxScreenHeight(void) { return VIRTUAL_H; }
 
 int getGfxCoreClockMhz(void)
