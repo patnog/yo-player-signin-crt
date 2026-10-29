@@ -99,6 +99,13 @@ static float uiScale(void)
    return targetIsDisplay && sdVideoOutput ? sdUiScale : 1.0f;
 }
 
+// Public query for layout code that needs the selected SD scale even before
+// a display draw call has started. Actual drawing still uses uiScale().
+float getGfxUiScaleFactor(void)
+{
+   return sdVideoOutput ? sdUiScale : 1.0f;
+}
+
 static float scaleUiX(float x)
 {
    float scale = uiScale();
