@@ -277,7 +277,7 @@ static void initPlay(void)
    initLabel(&timeRightLabel, &uiFont, 0, 0, 200, AUTO, 22, activeTheme->textPrimary, TEXT_NOWRAP, "");
    initLabelRaw(&toastLabel, &uiFont, 0, 0, 400, AUTO, 22, activeTheme->textPrimary, TEXT_NOWRAP, "");   // raw: shows track names
    initLabelRaw(&titleLabel, &uiFont, 0, 0, 1100, AUTO, 22, activeTheme->textPrimary, TEXT_NOWRAP_ELLIPSIS, "");
-   initLabelRaw(&subtitleLabel, &uiFont, 0, 0, 1600, AUTO, SUBTITLE_TEXT_SIZE, activeTheme->textPrimary, TEXT_WRAP, "");
+   initLabelRaw(&subtitleLabel, &uiFont, 0, 0, state.screenW - 160, AUTO, SUBTITLE_TEXT_SIZE, activeTheme->textPrimary, TEXT_WRAP, "");
    initLabelRaw(&subsHudLabel, &uiFont, 0, 0, 500, AUTO, 22, activeTheme->textPrimary, TEXT_NOWRAP_ELLIPSIS, "");
    for (int i = 0; i < MAX_CHAPTERS; i++) {
       initLabelRaw(&chapterLabels[i], &uiFont, 0, 0, 990, AUTO, CHAPTER_TEXT_SIZE, activeTheme->textPrimary, TEXT_NOWRAP_ELLIPSIS, "");
