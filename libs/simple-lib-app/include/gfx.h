@@ -2,9 +2,9 @@
 
 // 2D graphics over libgcm/RSX.
 // Color format: 0xAARRGGBB. Origin at top-left.
-// All drawing uses a virtual 1920x1080 canvas: lay screens out for 1080p and the GPU
-// scales the frame to the TV's real resolution (720p/576p/480p) automatically.
-// getGfxScreenWidth/Height return the virtual size; getGfxDisplayBuffer is real pixels.
+// Drawing uses a virtual canvas matching the active output aspect ratio:
+// 1920x1080 for 16:9 or 1440x1080 for 4:3. The GPU scales to the TV's real
+// framebuffer resolution. getGfxScreenWidth/Height return virtual dimensions.
 
 #include <stdint.h>
 #include <stddef.h>
@@ -112,7 +112,7 @@ void *allocGfxVideoBuffer(size_t size);
 void  freeGfxVideoBuffer(void *buffer);
 void  drawGfxYuvFrame(int x, int y, int w, int h, const void *yuvPlanes, int frameW, int frameH);
 
-// the virtual canvas size (always 1920x1080), NOT the TV's real resolution
+// the virtual canvas size (1920x1080 for 16:9, 1440x1080 for 4:3), NOT the TV's real resolution
 int getGfxScreenWidth(void);
 int getGfxScreenHeight(void);
 
