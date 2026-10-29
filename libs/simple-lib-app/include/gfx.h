@@ -33,10 +33,11 @@ typedef struct {
 
 int  initGfx(GfxVsync vsync);
 void termGfx(void);
-
-// SD-only interface scale; thumbnails and video are not scaled.
+// SD-only interface scale. Text is re-rasterised at the selected font size;
+// normal UI textures grow from their existing top-left anchor. Video thumbnails/frames stay fixed.
 int   isGfxSdVideoOutput(void);
 float getGfxSdUiScale(void);
+float getGfxUiScaleFactor(void); // selected factor on SD output, otherwise 1.0
 void  setGfxSdUiScale(float scale);
 
 // changes how a finished frame reaches the screen, at any time. GFX_VSYNC_ON waits for the display's
@@ -92,7 +93,7 @@ void fillGfxCircle(int cx, int cy, int radius, uint32_t argb);
 void drawGfxTriangle(float x0, float y0, uint32_t c0, float x1, float y1, uint32_t c1, float x2, float y2, uint32_t c2);
 void drawGfxLine(int x0, int y0, int x1, int y1, int thickness, uint32_t argb);
 void drawGfxTexture(int x, int y, int w, int h, GfxTexture tex, float u0, float v0, float u1, float v1, uint32_t tint, GfxFilter filter);
-// Draw a texture without changing its size, but follow the SD-scaled UI position (video thumbnails).
+// Draw a texture at its exact size and position, bypassing SD UI scaling (video thumbnails).
 void drawGfxTextureFixedSize(int x, int y, int w, int h, GfxTexture tex, float u0, float v0, float u1, float v1, uint32_t tint, GfxFilter filter);
 void endGfxFrame(void);
 
@@ -156,4 +157,3 @@ void       freeGfxTexture(GfxTexture *tex);
 // As freeGfxTexture, but for a texture the frame being drawn may still name: the memory goes back
 // at the start of the next frame instead, so nothing has to wait for the GPU mid-frame.
 void       retireGfxTexture(GfxTexture *tex);
-
