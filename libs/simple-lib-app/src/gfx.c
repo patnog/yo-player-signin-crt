@@ -58,6 +58,7 @@ typedef struct {
 #define VIRTUAL_H      1080
 static int       virtualW = VIRTUAL_W_WIDE;
 
+
 static int       initialized = 0;
 static int       screenW = 0;        // display buffer dimensions (the flipped surface, real pixels)
 static int       screenH = 0;
@@ -70,6 +71,45 @@ static int       targetH = 0;
 static int       surfaceW = 0;
 static int       surfaceH = 0;
 static int       targetIsDisplay = 0;   // drawing to the screen buffer (vs an offscreen target)
+
+// One tuning knob for SD output (480i and 480p). Keep at 1.0 to disable.
+// The transform is applied to display-target UI drawing, not offscreen text
+// rasterisation or video frames. Video-grid thumbnail images explicitly bypass it.
+static float     sdUiScale = 1.15f;
+static int       sdVideoOutput = 0;
+
+int isGfxSdVideoOutput(void)
+{
+   return sdVideoOutput;
+}
+
+float getGfxSdUiScale(void)
+{
+   return sdUiScale;
+}
+
+void setGfxSdUiScale(float scale)
+{
+   // 1.0 means normal size. Restrict the range to avoid accidental clipping.
+   if (scale >= 1.0f && scale <= 1.5f) sdUiScale = scale;
+}
+
+static float uiScale(void)
+{
+   return targetIsDisplay && sdVideoOutput ? sdUiScale : 1.0f;
+}
+
+static float scaleUiX(float x)
+{
+   float scale = uiScale();
+   return scale == 1.0f ? x : (float)targetW * 0.5f + (x - (float)targetW * 0.5f) * scale;
+}
+
+static float scaleUiY(float y)
+{
+   float scale = uiScale();
+   return scale == 1.0f ? y : (float)targetH * 0.5f + (y - (float)targetH * 0.5f) * scale;
+}
 static uint32_t  framePitch = 0;
 static uint32_t  frameOffset[FRAME_COUNT];
 static uint32_t  backBuffer = 0;
@@ -352,6 +392,9 @@ int initGfx(GfxVsync vsync)
 
    screenW = res.width;
    screenH = res.height;
+   // PS3 480i and 480p both use a 720x480 framebuffer. Resolution height is
+   // more portable across PSL1GHT/Sony SDK enum naming than mode constants.
+   sdVideoOutput = (res.height == 480);
 
    // Use the configured display aspect, not the framebuffer's pixel ratio:
    // SD modes can be 720x480 for either 4:3 or anamorphic 16:9 output.
@@ -633,6 +676,10 @@ void fillGfxRectangle(int x, int y, int w, int h, uint32_t argb)
    ensureWhiteTex();
    if (batchWouldOverflow(VERTS_PER_RECT)) return;
 
+   float sx0 = scaleUiX((float)x), sy0 = scaleUiY((float)y);
+   float sx1 = scaleUiX((float)(x + w)), sy1 = scaleUiY((float)(y + h));
+   x = (int)floorf(sx0 + 0.5f); y = (int)floorf(sy0 + 0.5f);
+   w = (int)floorf(sx1 + 0.5f) - x; h = (int)floorf(sy1 + 0.5f) - y;
    if (x < 0) { w += x; x = 0; }
    if (y < 0) { h += y; y = 0; }
    if (x + w > targetW) w = targetW - x;
@@ -683,6 +730,9 @@ void drawGfxTriangle(float x0, float y0, uint32_t c0, float x1, float y1, uint32
    ensureWhiteTex();
    if (batchWouldOverflow(VERTS_PER_TRIANGLE)) return;
 
+   x0 = scaleUiX(x0); y0 = scaleUiY(y0);
+   x1 = scaleUiX(x1); y1 = scaleUiY(y1);
+   x2 = scaleUiX(x2); y2 = scaleUiY(y2);
    float invW = 2.0f / (float)targetW;
    float invH = 2.0f / (float)targetH;
    float nx0 = x0 * invW - 1.0f, ny0 = 1.0f - y0 * invH;
@@ -738,6 +788,11 @@ static int getCircleSegments(int radius)
 void fillGfxCircle(int cx, int cy, int r, uint32_t argb)
 {
    if (!initialized || r <= 0) return;
+   float sx0 = scaleUiX((float)(cx - r)), sx1 = scaleUiX((float)(cx + r));
+   float sy0 = scaleUiY((float)(cy - r)), sy1 = scaleUiY((float)(cy + r));
+   cx = (int)floorf((sx0 + sx1) * 0.5f + 0.5f);
+   cy = (int)floorf((sy0 + sy1) * 0.5f + 0.5f);
+   r = (int)floorf((sx1 - sx0) * 0.5f + 0.5f);
    ensureWhiteTex();
    int segments = getCircleSegments(r);
    if (batchWouldOverflow(segments * VERTS_PER_TRIANGLE)) return;
@@ -812,9 +867,22 @@ static void flushBatch(void)
    batchFlushStart = batchVertCount;
 }
 
-void drawGfxTexture(int x, int y, int w, int h, GfxTexture tex, float u0, float v0, float u1, float v1, uint32_t tint, GfxFilter filter)
+static void drawGfxTextureInternal(int x, int y, int w, int h, GfxTexture tex,
+                                   float u0, float v0, float u1, float v1,
+                                   uint32_t tint, GfxFilter filter, int scaleMode)
 {
    if (!initialized || tex.w == 0 || tex.h == 0) return;
+   if (scaleMode == 1) {
+      float sx0 = scaleUiX((float)x), sy0 = scaleUiY((float)y);
+      float sx1 = scaleUiX((float)(x + w)), sy1 = scaleUiY((float)(y + h));
+      x = (int)floorf(sx0 + 0.5f); y = (int)floorf(sy0 + 0.5f);
+      w = (int)floorf(sx1 + 0.5f) - x; h = (int)floorf(sy1 + 0.5f) - y;
+   } else if (scaleMode == 2) {
+      // Keep the thumbnail's pixel dimensions, but move its origin with the
+      // scaled layout so it remains in the same grid position relative to UI.
+      x = (int)floorf(scaleUiX((float)x) + 0.5f);
+      y = (int)floorf(scaleUiY((float)y) + 0.5f);
+   }
 
    // nearest is crisp only at 1:1. on a sub-1080p screen every draw is shrunk from the virtual
    // canvas, so force smooth filtering there or text and sprites go blocky. offscreen targets
@@ -899,6 +967,21 @@ static void setYuvPlaneTexture(uint32_t unit, uint32_t offset, int width, int he
    cellGcmSetTextureControl(CTX, unit, CELL_GCM_TRUE, 0, 12 << 8, CELL_GCM_TEXTURE_MAX_ANISO_1);
    cellGcmSetTextureAddress(CTX, unit, CELL_GCM_TEXTURE_CLAMP_TO_EDGE, CELL_GCM_TEXTURE_CLAMP_TO_EDGE, CELL_GCM_TEXTURE_CLAMP_TO_EDGE, CELL_GCM_TEXTURE_UNSIGNED_REMAP_NORMAL, CELL_GCM_TEXTURE_ZFUNC_LESS, 0);
    cellGcmSetTextureFilter(CTX, unit, 0, CELL_GCM_TEXTURE_LINEAR, CELL_GCM_TEXTURE_LINEAR, CELL_GCM_TEXTURE_CONVOLUTION_QUINCUNX);
+}
+
+
+void drawGfxTexture(int x, int y, int w, int h, GfxTexture tex,
+                    float u0, float v0, float u1, float v1,
+                    uint32_t tint, GfxFilter filter)
+{
+   drawGfxTextureInternal(x, y, w, h, tex, u0, v0, u1, v1, tint, filter, 1);
+}
+
+void drawGfxTextureFixedSize(int x, int y, int w, int h, GfxTexture tex,
+                             float u0, float v0, float u1, float v1,
+                             uint32_t tint, GfxFilter filter)
+{
+   drawGfxTextureInternal(x, y, w, h, tex, u0, v0, u1, v1, tint, filter, 2);
 }
 
 void drawGfxYuvFrame(int x, int y, int w, int h, const void *yuvPlanes, int frameW, int frameH)
