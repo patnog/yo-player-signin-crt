@@ -34,6 +34,11 @@ typedef struct {
 int  initGfx(GfxVsync vsync);
 void termGfx(void);
 
+// SD-only interface scale; thumbnails and video are not scaled.
+int   isGfxSdVideoOutput(void);
+float getGfxSdUiScale(void);
+void  setGfxSdUiScale(float scale);
+
 // changes how a finished frame reaches the screen, at any time. GFX_VSYNC_ON waits for the display's
 // next refresh (smooth, but holds the frame back by up to one refresh); GFX_VSYNC_OFF shows it at the
 // next scan line, which is as soon as the screen can - at the cost of tearing.
@@ -87,6 +92,8 @@ void fillGfxCircle(int cx, int cy, int radius, uint32_t argb);
 void drawGfxTriangle(float x0, float y0, uint32_t c0, float x1, float y1, uint32_t c1, float x2, float y2, uint32_t c2);
 void drawGfxLine(int x0, int y0, int x1, int y1, int thickness, uint32_t argb);
 void drawGfxTexture(int x, int y, int w, int h, GfxTexture tex, float u0, float v0, float u1, float v1, uint32_t tint, GfxFilter filter);
+// Draw a texture without changing its size, but follow the SD-scaled UI position (video thumbnails).
+void drawGfxTextureFixedSize(int x, int y, int w, int h, GfxTexture tex, float u0, float v0, float u1, float v1, uint32_t tint, GfxFilter filter);
 void endGfxFrame(void);
 
 // Blocks until the RSX has finished all submitted commands. Call before reusing
