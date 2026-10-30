@@ -350,7 +350,11 @@ void initVideoGrid(VideoGrid *grid, Font *font, int x, int y, int width, int hei
    grid->font = font;
    grid->x = x; grid->y = y; grid->width = width; grid->height = height;
    int sdOutput = isGfxSdVideoOutput();
-   grid->columns = sdOutput ? 3 : GRID_COLS_WIDE;
+   // The 1440x1080 virtual canvas is the PS3's 4:3 output. Use a
+   // two-column layout there at every SD UI scale; keep three columns
+   // for 16:9 SD and the normal wide layout for HD.
+   int fourThreeSd = sdOutput && getGfxScreenWidth() <= 1600;
+   grid->columns = fourThreeSd ? 2 : (sdOutput ? 3 : GRID_COLS_WIDE);
    grid->gap = sdOutput ? 10 : GRID_GAP;
    // Reserve enough text space for the biggest 2.0x preset. This keeps grid
    // coordinates and thumbnail size fixed when L2 changes font size.
@@ -362,9 +366,12 @@ void initVideoGrid(VideoGrid *grid, Font *font, int x, int y, int width, int hei
    grid->metaOffset = sdOutput ? grid->titleSize * 2 + 6 : ROW_TITLE + 8;
 
    int maxTileW = (width - (grid->columns - 1) * grid->gap) / grid->columns;
-   // In either 4:3 or 16:9 SD output, cap tile width so three complete rows fit.
+   // Reserve enough vertical room for two rows on 4:3 SD and three rows
+   // on 16:9 SD. This lets the 4:3 thumbnails use the available width
+   // without overflowing the grid's vertical area.
    if (sdOutput) {
-      int maxStep = height / 3;
+      int maxVisibleRows = fourThreeSd ? 2 : 3;
+      int maxStep = height / maxVisibleRows;
       int maxThumbH = maxStep - grid->tileTextH - grid->gap;
       int widthFromHeight = maxThumbH > 0 ? maxThumbH * 16 / 9 : 1;
       if (maxTileW > widthFromHeight) maxTileW = widthFromHeight;
