@@ -28,6 +28,7 @@ typedef struct {
    ButtonHint hints[MAX_BUTTON_HINTS];
    int      count;
    int      stableLayout;   // keep each hint's anchor fixed at the maximum SD scale
+   float    renderedUiScale; // last SD UI scale used to size the captions
 } ButtonHints;
 
 void initButtonHints(ButtonHints *bar, Font *font, int y, int glyphHeight, int captionSize, uint32_t captionColor);
