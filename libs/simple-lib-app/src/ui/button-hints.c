@@ -1,16 +1,12 @@
 // button-hints - centered "[glyph] caption" pad-hint row (see ui/button-hints.h).
 
 #include "ui/button-hints.h"
+#include "string-utilities.h"
 #include <string.h>
 
 #define ICON_GAP 8    // between a glyph and its caption
 #define HINT_GAP 30   // between one hint and the next
 #define PAIR_GAP 8    // between two caption-less glyphs that form a pair (L1 + R1)
-
-static float hintFixedSizeScale(void)
-{
-   return isGfxSdVideoOutput() ? 1.5f : 1.0f;
-}
 
 void initButtonHints(ButtonHints *bar, Font *font, int y, int glyphHeight, int captionSize, uint32_t captionColor)
 {
@@ -30,8 +26,6 @@ int addButtonHint(ButtonHints *bar, GfxTexture glyph, const char *caption)
    hint->drawWidth = glyph.h > 0 ? glyph.w * bar->glyphHeight / glyph.h : bar->glyphHeight;
    hint->pairNext  = (caption == NULL || caption[0] == 0);
    initLabel(&hint->caption, bar->font, 0, 0, AUTO, AUTO, bar->captionSize, bar->captionColor, TEXT_NOWRAP, caption);
-   if (isGfxSdVideoOutput())
-      setLabelFixedRenderScale(&hint->caption, 1.5f, 1);
    // a caption-less hint is just the glyph; drop the icon gap so it clusters with the next one
    hint->width = hint->drawWidth + (hint->pairNext ? 0 : ICON_GAP + hint->caption.tt.tex.w);
    return bar->count - 1;
@@ -53,6 +47,41 @@ static float hintScale(const ButtonHints *bar)
 {
    float scale = bar->stableLayout ? getGfxUiScaleFactor() : 1.0f;
    return scale < 1.0f ? 1.0f : scale;
+}
+
+static float hintCurrentScale(void)
+{
+   float scale = getGfxUiScaleFactor();
+   return scale < 1.0f ? 1.0f : scale;
+}
+
+static int hintGlyphSize(const ButtonHints *bar, int baseSize)
+{
+   (void)bar;
+   if (!isGfxSdVideoOutput()) return baseSize;
+   return (int)(baseSize * 1.5f / hintCurrentScale() + 0.5f);
+}
+
+// Captions use the normal transformed draw path. Compensate their raster size
+// for the current UI zoom so their final on-screen size remains 1.5x.
+static void refreshHintCaptionSizes(ButtonHints *bar)
+{
+   if (!isGfxSdVideoOutput()) return;
+   float scale = hintCurrentScale();
+   if (bar->renderedUiScale == scale) return;
+
+   int size = (int)(bar->captionSize * 1.5f / scale + 0.5f);
+   if (size < 1) size = 1;
+   for (int i = 0; i < bar->count; i++) {
+      Label *caption = &bar->hints[i].caption;
+      if (caption->size == size) continue;
+      char text[LABEL_MAX_TEXT];
+      strCopy(text, sizeof text, caption->text);
+      freeLabel(caption);
+      caption->size = size;
+      setLabelText(caption, text);
+   }
+   bar->renderedUiScale = scale;
 }
 
 static int hintIconGap(const ButtonHints *bar)
@@ -81,17 +110,12 @@ static int hintDrawY(const ButtonHints *bar)
 
 static int drawHint(ButtonHints *bar, ButtonHint *hint, int x, int y)
 {
-   float fixedScale = hintFixedSizeScale();
-   int glyphHeight = (int)(bar->glyphHeight * fixedScale + 0.5f);
-   int glyphWidth = (int)(hint->drawWidth * fixedScale + 0.5f);
-   int rowMid = y + glyphHeight / 2;
-   if (hint->glyph.offset) {
-      if (isGfxSdVideoOutput())
-         drawGfxTextureFixedSizeScaledPosition(x, y, glyphWidth, glyphHeight, hint->glyph, 0, 0, 1, 1, 0xFFFFFFFF, GFX_FILTER_LINEAR);
-      else
-         drawGfxTexture(x, y, glyphWidth, glyphHeight, hint->glyph, 0, 0, 1, 1, 0xFFFFFFFF, GFX_FILTER_LINEAR);
-   }
-   x += glyphWidth;
+   int glyphH = hintGlyphSize(bar, bar->glyphHeight);
+   int glyphW = hintGlyphSize(bar, hint->drawWidth);
+   int rowMid = y + glyphH / 2;
+   if (hint->glyph.offset)
+      drawGfxTexture(x, y, glyphW, glyphH, hint->glyph, 0, 0, 1, 1, 0xFFFFFFFF, GFX_FILTER_LINEAR);
+   x += glyphW;
    if (hint->pairNext) return x;   // glyph only - the caption belongs to the hint it pairs with
    x += hintIconGap(bar);
    moveLabel(&hint->caption, x, rowMid - hint->caption.tt.tex.h / 2);
@@ -106,8 +130,10 @@ void setButtonHintGap(ButtonHints *bar, int gap)
 
 void setButtonHintsStableLayout(ButtonHints *bar, int enabled)
 {
-   if (bar)
+   if (bar) {
       bar->stableLayout = enabled != 0;
+      bar->renderedUiScale = 0.0f;
+   }
 }
 
 void setButtonHintShown(ButtonHints *bar, int index, int shown)
@@ -118,6 +144,7 @@ void setButtonHintShown(ButtonHints *bar, int index, int shown)
 
 void drawButtonHintsAt(ButtonHints *bar, int x)
 {
+   refreshHintCaptionSizes(bar);
    int y = hintDrawY(bar);
    for (int i = 0; i < bar->count; i++) {
       if (bar->hints[i].hidden) continue;
@@ -129,25 +156,18 @@ void drawButtonHintsAt(ButtonHints *bar, int x)
 
 void drawButtonHints(ButtonHints *bar, int screenWidth)
 {
-   float positionScale = isGfxSdVideoOutput() ? getGfxUiScaleFactor() : 1.0f;
-   if (positionScale < 1.0f) positionScale = 1.0f;
-   float fixedScale = hintFixedSizeScale();
-   float totalRendered = 0.0f;
+   refreshHintCaptionSizes(bar);
+   int total = 0;
    for (int i = 0; i < bar->count; i++) {
       if (bar->hints[i].hidden) continue;
 
       ButtonHint *hint = &bar->hints[i];
-      totalRendered += hint->drawWidth * fixedScale;
-      if (!hint->pairNext)
-         totalRendered += (hintIconGap(bar) + hint->caption.tt.tex.w) * positionScale;
-      if (i < bar->count - 1)
-         totalRendered += hintRowGap(bar, hint->pairNext) * positionScale;
+      total += hintGlyphSize(bar, hint->drawWidth);
+      if (!hint->pairNext) total += hintIconGap(bar) + hint->caption.tt.tex.w;
+      if (i < bar->count - 1) total += hintRowGap(bar, hint->pairNext);
    }
 
-   // The anchor still follows the selected UI zoom, but the glyphs and captions
-   // have fixed 1.5x dimensions. Invert the anchor transform to keep the row centred.
-   int x = (int)(screenWidth * 0.5f - totalRendered / (2.0f * positionScale) + 0.5f);
-   drawButtonHintsAt(bar, x);
+   drawButtonHintsAt(bar, (screenWidth - total) / 2);
 }
 
 void termButtonHints(ButtonHints *bar)

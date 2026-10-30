@@ -773,6 +773,11 @@ static void drawToast(void)
 
 static void drawPlay(void)
 {
+   // The SD UI zoom is intended for library/navigation screens only. Keep all playback
+   // controls and overlays at their original 1.0x geometry so the seek bar stays on-screen.
+   float selectedUiScale = getGfxSdUiScale();
+   setGfxSdUiScale(1.0f);
+
    fillGfxRectangle(0, 0, state.screenW, state.screenH, COLOR_BLACK);   // letterbox bars read as black, not the app background
 
    const uint8_t *frame = NULL;
@@ -800,6 +805,9 @@ static void drawPlay(void)
    // status up instead of a black screen; with no player this shows the failure message.
    if (!state.firstFrameSeen)
       drawLabelAt(&statusLabel, state.screenW / 2 - statusLabel.tt.tex.w / 2, state.screenH / 2 - 14);
+
+   // Restore the selected library scale before the next screen is drawn.
+   setGfxSdUiScale(selectedUiScale);
 }
 
 static void termPlay(void)

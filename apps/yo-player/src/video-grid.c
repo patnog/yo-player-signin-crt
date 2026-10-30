@@ -247,8 +247,8 @@ static void composeMeta(char *out, int cap, const SearchResult *item)
    }
 }
 
-// Keep only the first source line. The label's no-wrap/ellipsis mode handles
-// any remaining width constraint without rendering a second line.
+// Show only the first source line. The existing single-line ellipsis label
+// handles titles that are wider than the thumbnail.
 static void formatGridTitle(VideoGrid *grid, const char *source, char *out, int cap, float scale)
 {
    (void)grid;
@@ -405,12 +405,21 @@ void initVideoGrid(VideoGrid *grid, Font *font, int x, int y, int width, int hei
       initLabel(&grid->rows[i],      font, 0, 0, grid->tileW, AUTO, grid->titleSize, activeTheme->textPrimary,   TEXT_NOWRAP_ELLIPSIS, "");
       initLabel(&grid->metas[i],     font, 0, 0, grid->tileW, AUTO, grid->metaSize, activeTheme->textSecondary, TEXT_NOWRAP_ELLIPSIS, "");
       initLabel(&grid->durations[i], font, 0, 0, AUTO,        AUTO, DUR_SIZE,       activeTheme->textPrimary,   TEXT_NOWRAP,          "");
-      if (getGfxUiScaleFactor() >= 1.90f) grid->rows[i].size = grid->titleSize - 2;
-      setLabelScaleWithUi(&grid->rows[i], 1);
+      float uiScale = getGfxUiScaleFactor();
+      if (uiScale < 1.0f) uiScale = 1.0f;
+      if (sdOutput) {
+         // Use a larger title at 1.5x and 2.0x. Metadata uses the same
+         // rendered font size and is placed directly under the title.
+         float titleScale = uiScale >= 1.40f ? 2.0f : 1.5f;
+         int titleFontSize = (int)(grid->titleSize * titleScale / uiScale + 0.5f);
+         grid->rows[i].size = titleFontSize;
+         grid->metas[i].size = titleFontSize;
+         grid->durations[i].size = (int)(DUR_SIZE * 1.5f / uiScale + 0.5f);
+      }
       grid->rows[i].wrap = TEXT_NOWRAP_ELLIPSIS;
+      setLabelScaleWithUi(&grid->rows[i], 1);
       setLabelScaleWithUi(&grid->metas[i], 1);
       setLabelScaleWithUi(&grid->durations[i], 1);
-      if (isGfxSdVideoOutput()) setLabelFixedRenderScale(&grid->durations[i], 1.5f, 0);
    }
    initLabel(&grid->watchLaterBadge, font, 0, 0, AUTO, AUTO, WATCHLATER_BADGE_SIZE, activeTheme->textPrimary, TEXT_NOWRAP, "Watch Later");
    setLabelScaleWithUi(&grid->watchLaterBadge, 1);
@@ -523,12 +532,9 @@ static void drawTile(VideoGrid *grid, int i)
    int textY = ty + grid->thumbH + 6, alpha = watched ? WATCHED_ALPHA : 255;
    moveLabel(&grid->rows[i], tx, textY);
    drawLabelAlpha(&grid->rows[i], alpha);
-   float scale = getGfxUiScaleFactor();
-   if (scale <= 1.001f) {
-      int metaY = textY + (int)(grid->titleSize * 2.0f * scale + 6.0f);
-      moveLabel(&grid->metas[i], tx, metaY);
-      drawLabelAlpha(&grid->metas[i], alpha);
-   }
+   // Keep metadata directly below the title with no inter-line gap.
+   moveLabel(&grid->metas[i], tx, textY + grid->rows[i].tt.tex.h);
+   drawLabelAlpha(&grid->metas[i], alpha);
 }
 
 void drawVideoGrid(VideoGrid *grid)
@@ -538,8 +544,20 @@ void drawVideoGrid(VideoGrid *grid)
    // Re-rasterise only when L2 changes the preset, never from inside drawLabel.
    float scale = getGfxUiScaleFactor();
    if (scale != grid->labelScale) {
+      float sizeScale = scale < 1.0f ? 1.0f : scale;
       for (int i = grid->winStart; i < grid->winEnd; i++) {
-         grid->rows[i].size = scale >= 1.90f ? grid->titleSize - 2 : grid->titleSize;
+         if (isGfxSdVideoOutput()) {
+            float titleScale = sizeScale >= 1.40f ? 2.0f : 1.5f;
+            int titleFontSize = (int)(grid->titleSize * titleScale / sizeScale + 0.5f);
+            grid->rows[i].size = titleFontSize;
+            grid->metas[i].size = titleFontSize;
+            grid->durations[i].size = (int)(DUR_SIZE * 1.5f / sizeScale + 0.5f);
+         } else {
+            grid->rows[i].size = grid->titleSize;
+            grid->metas[i].size = grid->metaSize;
+            grid->durations[i].size = DUR_SIZE;
+         }
+         grid->rows[i].wrap = TEXT_NOWRAP_ELLIPSIS;
          refreshLabelScale(&grid->rows[i]);
          refreshLabelScale(&grid->metas[i]);
          refreshLabelScale(&grid->durations[i]);

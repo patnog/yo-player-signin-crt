@@ -91,7 +91,7 @@ float getGfxSdUiScale(void)
 void setGfxSdUiScale(float scale)
 {
    // 1.0 means normal size. Restrict the range to avoid accidental clipping.
-   if (scale >= 1.0f && scale <= 2.0f) sdUiScale = scale;
+   if (scale >= 1.0f && scale <= 1.5f) sdUiScale = scale;
 }
 
 static float uiScale(void)
