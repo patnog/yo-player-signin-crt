@@ -408,7 +408,11 @@ void initVideoGrid(VideoGrid *grid, Font *font, int x, int y, int width, int hei
       float uiScale = getGfxUiScaleFactor();
       if (uiScale < 1.0f) uiScale = 1.0f;
       if (sdOutput) {
-         grid->rows[i].size = (int)(grid->titleSize * 1.5f / uiScale + 0.5f);
+         // Keep titles at 1.5x for the 1.0x/1.5x presets, but let them
+         // reach a full 2.0x at the largest preset. The fixed-position
+         // label draw path uses this base size directly for rasterisation.
+         float titleScale = uiScale >= 1.90f ? 2.0f : 1.5f;
+         grid->rows[i].size = (int)(grid->titleSize * titleScale / uiScale + 0.5f);
          grid->durations[i].size = (int)(DUR_SIZE * 1.5f / uiScale + 0.5f);
       }
       grid->rows[i].wrap = TEXT_NOWRAP_ELLIPSIS;
@@ -545,7 +549,10 @@ void drawVideoGrid(VideoGrid *grid)
       float sizeScale = scale < 1.0f ? 1.0f : scale;
       for (int i = grid->winStart; i < grid->winEnd; i++) {
          if (isGfxSdVideoOutput()) {
-            grid->rows[i].size = (int)(grid->titleSize * 1.5f / sizeScale + 0.5f);
+            // At 2.0x, use a full 2.0x title font instead of shrinking
+            // the source size to compensate for the UI zoom.
+            float titleScale = sizeScale >= 1.90f ? 2.0f : 1.5f;
+            grid->rows[i].size = (int)(grid->titleSize * titleScale / sizeScale + 0.5f);
             grid->durations[i].size = (int)(DUR_SIZE * 1.5f / sizeScale + 0.5f);
          } else {
             grid->rows[i].size = grid->titleSize;
