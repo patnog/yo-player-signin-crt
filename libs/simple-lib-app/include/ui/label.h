@@ -29,7 +29,7 @@ void initLabel(Label *l, Font *font, int x, int y, int width, int height, int si
 void initLabelRaw(Label *l, Font *font, int x, int y, int width, int height, int size, uint32_t color, TextWrap wrap, const char *text);
 
 void setLabelText(Label *l, const char *text);
-void refreshLabelScale(Label *l);
+void refreshLabelScale(Label *l);\nvoid setLabelScaleWithUi(Label *l, int enabled);
 
 // re-renders the label in a new colour (for a live theme switch). a no-op when the colour is
 // unchanged; otherwise re-rasterises the current text so the change shows without new text.

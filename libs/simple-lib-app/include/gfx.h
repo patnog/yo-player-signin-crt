@@ -87,6 +87,7 @@ int  getGfxVerticesUsed(void);   // how many this frame has spent so far
 
 void clearGfx(uint32_t argb);
 void fillGfxRectangle(int x, int y, int w, int h, uint32_t argb);
+void fillGfxRectangleFixed(int x, int y, int w, int h, uint32_t argb);
 void strokeGfxRectangle(int x, int y, int w, int h, int thickness, uint32_t argb);
 void drawGfxBox(int x, int y, int w, int h, int thickness, uint32_t fill, uint32_t border);
 void fillGfxCircle(int cx, int cy, int radius, uint32_t argb);
@@ -95,6 +96,7 @@ void drawGfxLine(int x0, int y0, int x1, int y1, int thickness, uint32_t argb);
 void drawGfxTexture(int x, int y, int w, int h, GfxTexture tex, float u0, float v0, float u1, float v1, uint32_t tint, GfxFilter filter);
 // Draw a texture at its exact size and position, bypassing SD UI scaling (video thumbnails).
 void drawGfxTextureFixedSize(int x, int y, int w, int h, GfxTexture tex, float u0, float v0, float u1, float v1, uint32_t tint, GfxFilter filter);
+void drawGfxTextureFixedPosition(int x, int y, int w, int h, GfxTexture tex, float u0, float v0, float u1, float v1, uint32_t tint, GfxFilter filter);
 void endGfxFrame(void);
 
 // Blocks until the RSX has finished all submitted commands. Call before reusing

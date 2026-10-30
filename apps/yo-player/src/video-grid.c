@@ -247,11 +247,68 @@ static void composeMeta(char *out, int cap, const SearchResult *item)
    }
 }
 
+// At enlarged SD scales, wrap titles to two lines and truncate at a word
+// boundary. This keeps the title inside the text band reserved by the 1.0x grid.
+static void formatGridTitle(VideoGrid *grid, const char *source, char *out, int cap, float scale)
+{
+   if (scale <= 1.001f) {
+      strCopy(out, cap, source);
+      return;
+   }
+
+   int baseTitleSize = scale >= 1.90f ? grid->titleSize - 2 : grid->titleSize;
+   int fontSize = (int)(baseTitleSize * scale + 0.5f);
+   char line[ LABEL_MAX_TEXT ];
+   line[0] = 0;
+   out[0] = 0;
+   int lines = 1, truncated = 0;
+   const char *p = source;
+
+   while (*p) {
+      while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+      if (!*p) break;
+      const char *word = p;
+      while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
+      int wordLen = (int)(p - word);
+      if (wordLen <= 0) continue;
+
+      char candidate[LABEL_MAX_TEXT];
+      snprintf(candidate, sizeof candidate, "%s%s%.*s", line, line[0] ? " " : "", wordLen, word);
+      if (line[0] && measureFontText(grid->font, fontSize, candidate) > grid->tileW) {
+         if (lines >= 2) { truncated = 1; break; }
+         strCopy(out, cap, line);
+         strncat(out, "\n", cap - strlen(out) - 1);
+         strCopy(line, sizeof line, "");
+         lines++;
+         snprintf(candidate, sizeof candidate, "%.*s", wordLen, word);
+      }
+      strCopy(line, sizeof line, candidate);
+   }
+
+   if (line[0]) {
+      if (out[0]) strncat(out, "\n", cap - strlen(out) - 1);
+      strncat(out, line, cap - strlen(out) - 1);
+   }
+
+   if (truncated) {
+      // Append an ellipsis without splitting a UTF-8 code point: remove whole
+      // trailing words until the ASCII suffix fits.
+      char *last = strrchr(out, ' ');
+      char *newline = strrchr(out, '\n');
+      if (last && (!newline || last > newline)) *last = 0;
+      else if (newline) newline[0] = 0;
+      else out[0] = 0;
+      if (strlen(out) + 3 < (size_t)cap) strcat(out, "...");
+   }
+}
+
 static void materializeTile(VideoGrid *grid, int i)
 {
    char meta[128];
    const SearchResult *item = &grid->results.items[i];
-   setLabelText(&grid->rows[i], item->title);
+   char title[LABEL_MAX_TEXT];
+   formatGridTitle(grid, item->title, title, sizeof title, getGfxUiScaleFactor());
+   setLabelText(&grid->rows[i], title);
    composeMeta(meta, sizeof meta, item);
    setLabelText(&grid->metas[i], meta);
    setLabelText(&grid->durations[i], item->isLive ? "LIVE" : item->duration);
@@ -389,8 +446,15 @@ void initVideoGrid(VideoGrid *grid, Font *font, int x, int y, int width, int hei
       initLabel(&grid->rows[i],      font, 0, 0, grid->tileW, AUTO, grid->titleSize, activeTheme->textPrimary,   TEXT_NOWRAP_ELLIPSIS, "");
       initLabel(&grid->metas[i],     font, 0, 0, grid->tileW, AUTO, grid->metaSize, activeTheme->textSecondary, TEXT_NOWRAP_ELLIPSIS, "");
       initLabel(&grid->durations[i], font, 0, 0, AUTO,        AUTO, DUR_SIZE,       activeTheme->textPrimary,   TEXT_NOWRAP,          "");
+      if (getGfxUiScaleFactor() >= 1.90f) grid->rows[i].size = grid->titleSize - 2;
+      setLabelScaleWithUi(&grid->rows[i], 1);
+      grid->rows[i].wrap = getGfxUiScaleFactor() > 1.001f ? TEXT_WRAP : TEXT_NOWRAP_ELLIPSIS;
+      setLabelScaleWithUi(&grid->metas[i], 1);
+      setLabelScaleWithUi(&grid->durations[i], 1);
    }
    initLabel(&grid->watchLaterBadge, font, 0, 0, AUTO, AUTO, WATCHLATER_BADGE_SIZE, activeTheme->textPrimary, TEXT_NOWRAP, "Watch Later");
+   setLabelScaleWithUi(&grid->watchLaterBadge, 1);
+   grid->labelScale = getGfxUiScaleFactor();
 }
 
 void termVideoGrid(VideoGrid *grid)
@@ -469,23 +533,22 @@ static void drawTile(VideoGrid *grid, int i)
 
    if (i == grid->selected) {
       int ring = activeTheme->focusThickness;
-      fillGfxRectangle(tx - ring, ty - ring, grid->tileW + 2 * ring, grid->thumbH + 2 * ring, activeTheme->focusBorder);
+      fillGfxRectangleFixed(tx - ring, ty - ring, grid->tileW + 2 * ring, grid->thumbH + 2 * ring, activeTheme->focusBorder);
    }
 
    if (grid->thumbs[i].tex.offset)
       drawGfxTextureFixedSize(tx, ty, grid->tileW, grid->thumbH, grid->thumbs[i].tex, 0, 0, 1, 1, watched ? activeTheme->watchedThumbTint : 0xFFFFFFFF, GFX_FILTER_LINEAR);
    else
-      fillGfxRectangle(tx, ty, grid->tileW, grid->thumbH, activeTheme->surface);
+      fillGfxRectangleFixed(tx, ty, grid->tileW, grid->thumbH, activeTheme->surface);
 
-   float uiScale = getGfxUiScaleFactor();
-   int padX = (int)(6.0f * uiScale + 0.5f);
-   int padY = (int)(4.0f * uiScale + 0.5f);
-   int edgeGap = (int)(6.0f * uiScale + 0.5f);
+   int padX = 6;
+   int padY = 4;
+   int edgeGap = 6;
    if (item->duration[0] || item->isLive) {
       int badgeW = grid->durations[i].tt.tex.w + 2 * padX;
       int badgeH = grid->durations[i].tt.tex.h + 2 * padY;
       int badgeX = tx + grid->tileW - badgeW - edgeGap, badgeY = ty + grid->thumbH - badgeH - edgeGap;
-      fillGfxRectangle(badgeX, badgeY, badgeW, badgeH, item->isLive ? activeTheme->accent : activeTheme->badgeFill);
+      fillGfxRectangleFixed(badgeX, badgeY, badgeW, badgeH, item->isLive ? activeTheme->accent : activeTheme->badgeFill);
       drawLabelAt(&grid->durations[i], badgeX + padX, badgeY + padY);
    }
 
@@ -493,18 +556,42 @@ static void drawTile(VideoGrid *grid, int i)
       int badgeW = grid->watchLaterBadge.tt.tex.w + 2 * padX;
       int badgeH = grid->watchLaterBadge.tt.tex.h + 2 * padY;
       int badgeX = tx + grid->tileW - badgeW - edgeGap, badgeY = ty + 6;
-      fillGfxRectangle(badgeX, badgeY, badgeW, badgeH, activeTheme->badgeFill);
+      fillGfxRectangleFixed(badgeX, badgeY, badgeW, badgeH, activeTheme->badgeFill);
       drawLabelAt(&grid->watchLaterBadge, badgeX + padX, badgeY + padY);
    }
 
    int textY = ty + grid->thumbH + 6, alpha = watched ? WATCHED_ALPHA : 255;
-   moveLabel(&grid->rows[i],  tx, textY);                    drawLabelAlpha(&grid->rows[i],  alpha);
-   moveLabel(&grid->metas[i], tx, textY + grid->metaOffset); drawLabelAlpha(&grid->metas[i], alpha);
+   moveLabel(&grid->rows[i], tx, textY);
+   drawLabelAlpha(&grid->rows[i], alpha);
+   float scale = getGfxUiScaleFactor();
+   if (scale <= 1.001f) {
+      int metaY = textY + (int)(grid->titleSize * 2.0f * scale + 6.0f);
+      moveLabel(&grid->metas[i], tx, metaY);
+      drawLabelAlpha(&grid->metas[i], alpha);
+   }
 }
 
 void drawVideoGrid(VideoGrid *grid)
 {
    if (grid->stage != GRID_READY) return;
+
+   // Re-rasterise only when L2 changes the preset, never from inside drawLabel.
+   float scale = getGfxUiScaleFactor();
+   if (scale != grid->labelScale) {
+      for (int i = grid->winStart; i < grid->winEnd; i++) {
+         grid->rows[i].size = scale >= 1.90f ? grid->titleSize - 2 : grid->titleSize;
+         grid->rows[i].wrap = scale > 1.001f ? TEXT_WRAP : TEXT_NOWRAP_ELLIPSIS;
+         refreshLabelScale(&grid->rows[i]);
+         refreshLabelScale(&grid->metas[i]);
+         refreshLabelScale(&grid->durations[i]);
+         char title[LABEL_MAX_TEXT];
+         formatGridTitle(grid, grid->results.items[i].title, title, sizeof title, scale);
+         setLabelText(&grid->rows[i], title);
+      }
+      refreshLabelScale(&grid->watchLaterBadge);
+      grid->labelScale = scale;
+   }
+
    for (int i = 0; i < grid->results.count; i++) {
       int row = i / grid->columns;
       if (row >= grid->scrollRow && row < grid->scrollRow + grid->visibleRows) drawTile(grid, i);

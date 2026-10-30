@@ -34,8 +34,28 @@ void initLabelRaw(Label *l, Font *font, int x, int y, int width, int height, int
 // re-rasterises the current text/colour into the texture (raw = no {i}/{b}/{color=} markup parsing).
 static void renderLabel(Label *l)
 {
-   if (l->raw) renderFontRaw(&l->tt, l->font, l->size, l->text, l->color, l->width, l->wrap);
-   else        renderFont(&l->tt, l->font, l->size, l->text, l->color, l->width, l->wrap);
+   float scale = l->scaleWithUi ? getGfxUiScaleFactor() : 1.0f;
+   int renderSize = (int)(l->size * scale + 0.5f);
+   if (renderSize < 1) renderSize = 1;
+   if (l->raw) renderFontRaw(&l->tt, l->font, renderSize, l->text, l->color, l->width, l->wrap);
+   else        renderFont(&l->tt, l->font, renderSize, l->text, l->color, l->width, l->wrap);
+   l->renderedScale = scale;
+}
+
+void refreshLabelScale(Label *l)
+{
+   if (!l || !l->scaleWithUi) return;
+   float scale = getGfxUiScaleFactor();
+   if (scale != l->renderedScale) renderLabel(l);
+}
+
+void setLabelScaleWithUi(Label *l, int enabled)
+{
+   if (!l) return;
+   enabled = enabled != 0;
+   if (l->scaleWithUi == enabled) return;
+   l->scaleWithUi = enabled;
+   renderLabel(l);
 }
 
 void setLabelText(Label *l, const char *text)
@@ -69,7 +89,10 @@ void drawLabelAlpha(const Label *l, int alpha)
 {
    if (l->tt.tex.w > 0) {
       uint32_t tint = ((uint32_t)(alpha & 0xFF) << 24) | 0x00FFFFFF;
-      drawGfxTexture(l->x, l->y, l->tt.tex.w, l->tt.tex.h, l->tt.tex, 0.0f, 0.0f, 1.0f, 1.0f, tint, GFX_FILTER_NEAREST);
+      if (l->scaleWithUi)
+         drawGfxTextureFixedPosition(l->x, l->y, l->tt.tex.w, l->tt.tex.h, l->tt.tex, 0.0f, 0.0f, 1.0f, 1.0f, tint, GFX_FILTER_NEAREST);
+      else
+         drawGfxTexture(l->x, l->y, l->tt.tex.w, l->tt.tex.h, l->tt.tex, 0.0f, 0.0f, 1.0f, 1.0f, tint, GFX_FILTER_NEAREST);
    }
 }
 

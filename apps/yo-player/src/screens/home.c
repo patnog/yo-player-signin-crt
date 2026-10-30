@@ -359,6 +359,10 @@ static void initHome(void)
    uiFont = openSystemFont(FONT_POP);
    initLabel(&titleLabel,  &uiFont, MARGIN_X, headerY, home.screenW - 2 * MARGIN_X, AUTO, TITLE_SIZE, activeTheme->textPrimary, TEXT_NOWRAP_ELLIPSIS, "");
    initLabel(&statusLabel, &uiFont, MARGIN_X, gridTop, home.screenW - 2 * MARGIN_X, AUTO, 21, activeTheme->textSecondary, TEXT_NOWRAP, "Loading...");
+   // Home heading/status grow by rerasterising their font, while retaining their
+   // original anchors instead of being pushed off the 4:3 safe area.
+   setLabelScaleWithUi(&titleLabel, 1);
+   setLabelScaleWithUi(&statusLabel, 1);
 
    if (sdHintsTwoRows) {
       // Reserve the maximum row height so pressing L2 only changes text/icon size,
@@ -469,6 +473,10 @@ static void updateHome(void)
 
 static void drawHome(void)
 {
+   // Explicit, change-only refresh: never allocate/rebuild text textures from
+   // inside drawLabel itself.
+   refreshLabelScale(&titleLabel);
+   refreshLabelScale(&statusLabel);
    fillGfxRectangle(0, 0, home.screenW, home.screenH, activeTheme->appBg);
    drawLabel(&titleLabel);
    if (gridStage(&home.grid) == GRID_READY) {

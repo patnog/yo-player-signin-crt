@@ -91,7 +91,7 @@ float getGfxSdUiScale(void)
 void setGfxSdUiScale(float scale)
 {
    // 1.0 means normal size. Restrict the range to avoid accidental clipping.
-   if (scale >= 1.0f && scale <= 1.5f) sdUiScale = scale;
+   if (scale >= 1.0f && scale <= 2.0f) sdUiScale = scale;
 }
 
 static float uiScale(void)
@@ -677,16 +677,18 @@ static void reportFrameBudget(void)
       logWarn("[gfx] frame used %d of %d vertices (%d%%)\n", batchVertCount, MAX_VERTS, usedPercent);
 }
 
-void fillGfxRectangle(int x, int y, int w, int h, uint32_t argb)
+static void fillGfxRectangleInternal(int x, int y, int w, int h, uint32_t argb, int applyScale)
 {
    if (!initialized) return;
    ensureWhiteTex();
    if (batchWouldOverflow(VERTS_PER_RECT)) return;
 
-   float sx0 = scaleUiX((float)x), sy0 = scaleUiY((float)y);
-   float sx1 = scaleUiX((float)(x + w)), sy1 = scaleUiY((float)(y + h));
-   x = (int)floorf(sx0 + 0.5f); y = (int)floorf(sy0 + 0.5f);
-   w = (int)floorf(sx1 + 0.5f) - x; h = (int)floorf(sy1 + 0.5f) - y;
+   if (applyScale) {
+      float sx0 = scaleUiX((float)x), sy0 = scaleUiY((float)y);
+      float sx1 = scaleUiX((float)(x + w)), sy1 = scaleUiY((float)(y + h));
+      x = (int)floorf(sx0 + 0.5f); y = (int)floorf(sy0 + 0.5f);
+      w = (int)floorf(sx1 + 0.5f) - x; h = (int)floorf(sy1 + 0.5f) - y;
+   }
    if (x < 0) { w += x; x = 0; }
    if (y < 0) { h += y; y = 0; }
    if (x + w > targetW) w = targetW - x;
@@ -706,6 +708,17 @@ void fillGfxRectangle(int x, int y, int w, int h, uint32_t argb)
    v[5] = (GfxVertex){ x0, y1, 0.0f, rgba, 0.0f, 0.0f };
 
    batchVertCount += VERTS_PER_RECT;
+
+}
+
+void fillGfxRectangle(int x, int y, int w, int h, uint32_t argb)
+{
+   fillGfxRectangleInternal(x, y, w, h, argb, 1);
+}
+
+void fillGfxRectangleFixed(int x, int y, int w, int h, uint32_t argb)
+{
+   fillGfxRectangleInternal(x, y, w, h, argb, 0);
 }
 
 // metro-style border: four edges drawn inward, so the outline stays within the w x h bounds.
@@ -885,11 +898,10 @@ static void drawGfxTextureInternal(int x, int y, int w, int h, GfxTexture tex,
       x = (int)floorf(sx0 + 0.5f); y = (int)floorf(sy0 + 0.5f);
       w = (int)floorf(sx1 + 0.5f) - x; h = (int)floorf(sy1 + 0.5f) - y;
    } else if (scaleMode == 2) {
-      // Keep the thumbnail's pixel dimensions, but move its origin with the
-      // scaled layout so it remains in the same grid position relative to UI.
+      // Legacy fixed-size mode: preserve dimensions while scaling the anchor.
       x = (int)floorf(scaleUiX((float)x) + 0.5f);
       y = (int)floorf(scaleUiY((float)y) + 0.5f);
-   }
+   } // scaleMode 3 deliberately bypasses both coordinate and size scaling.
 
    // nearest is crisp only at 1:1. on a sub-1080p screen every draw is shrunk from the virtual
    // canvas, so force smooth filtering there or text and sprites go blocky. offscreen targets
@@ -988,7 +1000,14 @@ void drawGfxTextureFixedSize(int x, int y, int w, int h, GfxTexture tex,
                              float u0, float v0, float u1, float v1,
                              uint32_t tint, GfxFilter filter)
 {
-   drawGfxTextureInternal(x, y, w, h, tex, u0, v0, u1, v1, tint, filter, 2);
+   drawGfxTextureInternal(x, y, w, h, tex, u0, v0, u1, v1, tint, filter, 3);
+}
+
+void drawGfxTextureFixedPosition(int x, int y, int w, int h, GfxTexture tex,
+                                 float u0, float v0, float u1, float v1,
+                                 uint32_t tint, GfxFilter filter)
+{
+   drawGfxTextureInternal(x, y, w, h, tex, u0, v0, u1, v1, tint, filter, 3);
 }
 
 void drawGfxYuvFrame(int x, int y, int w, int h, const void *yuvPlanes, int frameW, int frameH)
