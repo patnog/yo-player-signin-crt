@@ -1010,6 +1010,14 @@ void drawGfxTextureFixedPosition(int x, int y, int w, int h, GfxTexture tex,
    drawGfxTextureInternal(x, y, w, h, tex, u0, v0, u1, v1, tint, filter, 3);
 }
 
+void drawGfxTextureFixedSizeScaledPosition(int x, int y, int w, int h, GfxTexture tex,
+                                           float u0, float v0, float u1, float v1,
+                                           uint32_t tint, GfxFilter filter)
+{
+   // Keep the requested dimensions while preserving the normal SD anchor transform.
+   drawGfxTextureInternal(x, y, w, h, tex, u0, v0, u1, v1, tint, filter, 2);
+}
+
 void drawGfxYuvFrame(int x, int y, int w, int h, const void *yuvPlanes, int frameW, int frameH)
 {
    if (!initialized || !yuvPlanes || frameW <= 0 || frameH <= 0) return;

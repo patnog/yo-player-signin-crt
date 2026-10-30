@@ -247,59 +247,18 @@ static void composeMeta(char *out, int cap, const SearchResult *item)
    }
 }
 
-// At enlarged SD scales, wrap titles to two lines and truncate at a word
-// boundary. This keeps the title inside the text band reserved by the 1.0x grid.
+// Keep only the first source line. The label's no-wrap/ellipsis mode handles
+// any remaining width constraint without rendering a second line.
 static void formatGridTitle(VideoGrid *grid, const char *source, char *out, int cap, float scale)
 {
-   if (scale <= 1.001f) {
-      strCopy(out, cap, source);
-      return;
+   (void)grid;
+   (void)scale;
+   int length = 0;
+   while (source[length] && source[length] != '\n' && source[length] != '\r' && length < cap - 1) {
+      out[length] = source[length];
+      length++;
    }
-
-   int baseTitleSize = scale >= 1.90f ? grid->titleSize - 2 : grid->titleSize;
-   int fontSize = (int)(baseTitleSize * scale + 0.5f);
-   char line[ LABEL_MAX_TEXT ];
-   line[0] = 0;
-   out[0] = 0;
-   int lines = 1, truncated = 0;
-   const char *p = source;
-
-   while (*p) {
-      while (*p == ' ' || *p == '\t' || *p == '\n') p++;
-      if (!*p) break;
-      const char *word = p;
-      while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
-      int wordLen = (int)(p - word);
-      if (wordLen <= 0) continue;
-
-      char candidate[LABEL_MAX_TEXT];
-      snprintf(candidate, sizeof candidate, "%s%s%.*s", line, line[0] ? " " : "", wordLen, word);
-      if (line[0] && measureFontText(grid->font, fontSize, candidate) > grid->tileW) {
-         if (lines >= 2) { truncated = 1; break; }
-         strCopy(out, cap, line);
-         strncat(out, "\n", cap - strlen(out) - 1);
-         strCopy(line, sizeof line, "");
-         lines++;
-         snprintf(candidate, sizeof candidate, "%.*s", wordLen, word);
-      }
-      strCopy(line, sizeof line, candidate);
-   }
-
-   if (line[0]) {
-      if (out[0]) strncat(out, "\n", cap - strlen(out) - 1);
-      strncat(out, line, cap - strlen(out) - 1);
-   }
-
-   if (truncated) {
-      // Append an ellipsis without splitting a UTF-8 code point: remove whole
-      // trailing words until the ASCII suffix fits.
-      char *last = strrchr(out, ' ');
-      char *newline = strrchr(out, '\n');
-      if (last && (!newline || last > newline)) *last = 0;
-      else if (newline) newline[0] = 0;
-      else out[0] = 0;
-      if (strlen(out) + 3 < (size_t)cap) strcat(out, "...");
-   }
+   out[length] = 0;
 }
 
 static void materializeTile(VideoGrid *grid, int i)
@@ -448,9 +407,10 @@ void initVideoGrid(VideoGrid *grid, Font *font, int x, int y, int width, int hei
       initLabel(&grid->durations[i], font, 0, 0, AUTO,        AUTO, DUR_SIZE,       activeTheme->textPrimary,   TEXT_NOWRAP,          "");
       if (getGfxUiScaleFactor() >= 1.90f) grid->rows[i].size = grid->titleSize - 2;
       setLabelScaleWithUi(&grid->rows[i], 1);
-      grid->rows[i].wrap = getGfxUiScaleFactor() > 1.001f ? TEXT_WRAP : TEXT_NOWRAP_ELLIPSIS;
+      grid->rows[i].wrap = TEXT_NOWRAP_ELLIPSIS;
       setLabelScaleWithUi(&grid->metas[i], 1);
       setLabelScaleWithUi(&grid->durations[i], 1);
+      if (isGfxSdVideoOutput()) setLabelFixedRenderScale(&grid->durations[i], 1.5f, 0);
    }
    initLabel(&grid->watchLaterBadge, font, 0, 0, AUTO, AUTO, WATCHLATER_BADGE_SIZE, activeTheme->textPrimary, TEXT_NOWRAP, "Watch Later");
    setLabelScaleWithUi(&grid->watchLaterBadge, 1);
@@ -580,7 +540,6 @@ void drawVideoGrid(VideoGrid *grid)
    if (scale != grid->labelScale) {
       for (int i = grid->winStart; i < grid->winEnd; i++) {
          grid->rows[i].size = scale >= 1.90f ? grid->titleSize - 2 : grid->titleSize;
-         grid->rows[i].wrap = scale > 1.001f ? TEXT_WRAP : TEXT_NOWRAP_ELLIPSIS;
          refreshLabelScale(&grid->rows[i]);
          refreshLabelScale(&grid->metas[i]);
          refreshLabelScale(&grid->durations[i]);

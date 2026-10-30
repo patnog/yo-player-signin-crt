@@ -34,7 +34,7 @@ void initLabelRaw(Label *l, Font *font, int x, int y, int width, int height, int
 // re-rasterises the current text/colour into the texture (raw = no {i}/{b}/{color=} markup parsing).
 static void renderLabel(Label *l)
 {
-   float scale = l->scaleWithUi ? getGfxUiScaleFactor() : 1.0f;
+   float scale = l->fixedRenderScale > 0.0f ? l->fixedRenderScale : (l->scaleWithUi ? getGfxUiScaleFactor() : 1.0f);
    int renderSize = (int)(l->size * scale + 0.5f);
    if (renderSize < 1) renderSize = 1;
    if (l->raw) renderFontRaw(&l->tt, l->font, renderSize, l->text, l->color, l->width, l->wrap);
@@ -44,7 +44,7 @@ static void renderLabel(Label *l)
 
 void refreshLabelScale(Label *l)
 {
-   if (!l || !l->scaleWithUi) return;
+   if (!l || !l->scaleWithUi || l->fixedRenderScale > 0.0f) return;
    float scale = getGfxUiScaleFactor();
    if (scale != l->renderedScale) renderLabel(l);
 }
@@ -55,6 +55,16 @@ void setLabelScaleWithUi(Label *l, int enabled)
    enabled = enabled != 0;
    if (l->scaleWithUi == enabled) return;
    l->scaleWithUi = enabled;
+   renderLabel(l);
+}
+
+void setLabelFixedRenderScale(Label *l, float scale, int scalePositionWithUi)
+{
+   if (!l) return;
+   if (scale < 0.0f) scale = 0.0f;
+   if (l->fixedRenderScale == scale && l->scalePositionWithUi == (scalePositionWithUi != 0)) return;
+   l->fixedRenderScale = scale;
+   l->scalePositionWithUi = scalePositionWithUi != 0;
    renderLabel(l);
 }
 
@@ -89,7 +99,9 @@ void drawLabelAlpha(const Label *l, int alpha)
 {
    if (l->tt.tex.w > 0) {
       uint32_t tint = ((uint32_t)(alpha & 0xFF) << 24) | 0x00FFFFFF;
-      if (l->scaleWithUi)
+      if (l->scalePositionWithUi)
+         drawGfxTextureFixedSizeScaledPosition(l->x, l->y, l->tt.tex.w, l->tt.tex.h, l->tt.tex, 0.0f, 0.0f, 1.0f, 1.0f, tint, GFX_FILTER_NEAREST);
+      else if (l->scaleWithUi)
          drawGfxTextureFixedPosition(l->x, l->y, l->tt.tex.w, l->tt.tex.h, l->tt.tex, 0.0f, 0.0f, 1.0f, 1.0f, tint, GFX_FILTER_NEAREST);
       else
          drawGfxTexture(l->x, l->y, l->tt.tex.w, l->tt.tex.h, l->tt.tex, 0.0f, 0.0f, 1.0f, 1.0f, tint, GFX_FILTER_NEAREST);

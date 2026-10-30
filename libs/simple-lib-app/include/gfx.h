@@ -97,6 +97,7 @@ void drawGfxTexture(int x, int y, int w, int h, GfxTexture tex, float u0, float 
 // Draw a texture at its exact size and position, bypassing SD UI scaling (video thumbnails).
 void drawGfxTextureFixedSize(int x, int y, int w, int h, GfxTexture tex, float u0, float v0, float u1, float v1, uint32_t tint, GfxFilter filter);
 void drawGfxTextureFixedPosition(int x, int y, int w, int h, GfxTexture tex, float u0, float v0, float u1, float v1, uint32_t tint, GfxFilter filter);
+void drawGfxTextureFixedSizeScaledPosition(int x, int y, int w, int h, GfxTexture tex, float u0, float v0, float u1, float v1, uint32_t tint, GfxFilter filter);
 void endGfxFrame(void);
 
 // Blocks until the RSX has finished all submitted commands. Call before reusing

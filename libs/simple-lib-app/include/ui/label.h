@@ -18,6 +18,8 @@ typedef struct {
    TextWrap wrap;
    int raw;   // skip {i}/{b}/{color=} style-tag parsing - see initLabelRaw
    int scaleWithUi; // rerasterise using the selected UI scale
+   float fixedRenderScale; // optional fixed raster scale, independent of the selected UI zoom
+   int scalePositionWithUi; // scale the anchor but keep the rasterised texture dimensions fixed
    float renderedScale; // font-scale factor used to build tt; refreshed on draw after L2 changes
    char text[LABEL_MAX_TEXT];
 } Label;
@@ -32,6 +34,7 @@ void initLabelRaw(Label *l, Font *font, int x, int y, int width, int height, int
 void setLabelText(Label *l, const char *text);
 void refreshLabelScale(Label *l);
 void setLabelScaleWithUi(Label *l, int enabled);
+void setLabelFixedRenderScale(Label *l, float scale, int scalePositionWithUi);
 
 // re-renders the label in a new colour (for a live theme switch). a no-op when the colour is
 // unchanged; otherwise re-rasterises the current text so the change shows without new text.
