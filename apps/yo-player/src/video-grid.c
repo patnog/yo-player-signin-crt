@@ -117,9 +117,12 @@ static int thumbFrontier(const VideoGrid *grid)
 static void worker(uint64_t arg)
 {
    VideoGrid *grid = (VideoGrid *)(uintptr_t)arg;
+   logInfo("[diag-grid] worker begin grid=%p job=%d stage=%d\n", grid, grid->job, grid->stage);
    switch (grid->job) {
    case JOB_LOAD: {
+      logInfo("[diag-grid] JOB_LOAD fetch begin grid=%p\n", grid);
       int rc = grid->fetch(NULL, &grid->results, grid->fetchUser);
+      logInfo("[diag-grid] JOB_LOAD fetch returned rc=%d count=%d\n", rc, grid->results.count);
       grid->stage = (rc == 0 && grid->results.count > 0) ? GRID_READY : GRID_EMPTY;
       __sync_synchronize();
       grid->searchParsed = 1;
@@ -151,6 +154,7 @@ static void worker(uint64_t arg)
    }
    __sync_synchronize();
    grid->workerDone = 1;
+   logInfo("[diag-grid] worker done grid=%p job=%d stage=%d count=%d\n", grid, grid->job, grid->stage, grid->results.count);
    exitThread();
 }
 
@@ -200,14 +204,18 @@ static void resetFeed(VideoGrid *grid)
 
 static void beginFeed(VideoGrid *grid)
 {
+   logInfo("[diag-grid] beginFeed grid=%p job=%d threadActive=%d\n", grid, grid->job, grid->threadActive);
    if (grid->job == JOB_CACHE) {   // results already in hand: show immediately, worker only fetches thumbnails
       grid->stage = GRID_READY;
       __sync_synchronize();
       grid->searchParsed = 1;
    }
    if (!spawnWorker(grid)) {
+      logInfo("[diag-grid] beginFeed spawnWorker failed grid=%p\n", grid);
       grid->workerDone = 1;
       if (grid->job != JOB_CACHE) { grid->stage = GRID_EMPTY; grid->searchParsed = 1; }
+   } else {
+      logInfo("[diag-grid] beginFeed spawnWorker succeeded grid=%p tid=%u\n", grid, (unsigned)grid->workerTid);
    }
 }
 

@@ -1,6 +1,7 @@
 // screen-manager - owns the active screen + stack and drives the active screen (see screen-manager.h).
 #include "screen-manager.h"
 #include <stddef.h>
+#include "dbg.h"
 
 #define SCREEN_MAX_STACK 8
 
@@ -25,13 +26,18 @@ void changeScreen(Screen *newScreen)
 
 void pushScreen(Screen *newScreen)
 {
-   if (!newScreen || screenDepth >= SCREEN_MAX_STACK) return;
-   if (currentScreen && currentScreen->suspend) currentScreen->suspend();
+   if (!newScreen || screenDepth >= SCREEN_MAX_STACK) {
+      logInfo("[diag-screen] pushScreen rejected newScreen=%p depth=%d\n", newScreen, screenDepth);
+      return;
+   }
+   logInfo("[diag-screen] pushScreen begin depth=%d current=%p next=%p\n", screenDepth, currentScreen, newScreen);
+   if (currentScreen && currentScreen->suspend) { logInfo("[diag-screen] current suspend begin\n"); currentScreen->suspend(); logInfo("[diag-screen] current suspend returned\n"); }
    if (currentScreen) currentScreen->status = SCREEN_SUSPENDED;
    currentScreen = newScreen;
    screenStack[screenDepth++] = currentScreen;
-   if (currentScreen->init) currentScreen->init();
+   if (currentScreen->init) { logInfo("[diag-screen] new screen init begin depth=%d\n", screenDepth); currentScreen->init(); logInfo("[diag-screen] new screen init returned\n"); }
    currentScreen->status = SCREEN_ACTIVE;
+   logInfo("[diag-screen] pushScreen complete depth=%d\n", screenDepth);
 }
 
 void popScreen(void)

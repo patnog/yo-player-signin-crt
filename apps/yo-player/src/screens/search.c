@@ -18,6 +18,7 @@
 #include "screen-manager.h"
 #include "osk-input.h"
 #include "string-utilities.h"
+#include "dbg.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -55,12 +56,20 @@ static ButtonHints hints;
 
 static int searchFetch(const char *token, SearchResults *out, void *user)
 {
+   int rc;
    (void)user;
+   logInfo("[diag-search] fetch begin mode=%s queryLen=%d channelIdLen=%d token=%s\n",
+      search.channelId[0] ? "channel" : "query", (int)strlen(search.query),
+      (int)strlen(search.channelId), token ? "yes" : "no");
    if (search.channelId[0]) {
       const char *first = search.channelSortToken[0] ? search.channelSortToken : NULL;
-      return getChannelVideos(search.channelId, token ? token : first, out);
+      rc = getChannelVideos(search.channelId, token ? token : first, out);
+   } else {
+      rc = searchVideos(search.query, search.sort, token, out);
    }
-   return searchVideos(search.query, search.sort, token, out);
+   logInfo("[diag-search] fetch returned rc=%d count=%d continuation=%s\n",
+      rc, out ? out->count : -1, out && out->continuation[0] ? "yes" : "no");
+   return rc;
 }
 
 // in channel mode Triangle toggles the subscription (you're already in the channel); elsewhere it drills in.
@@ -83,13 +92,22 @@ static void setHeading(void)
 
 static void reload(void)
 {
+   logInfo("[diag-search] reload begin mode=%s queryLen=%d channelIdLen=%d gridThreadActive=%d\n",
+      search.channelId[0] ? "channel" : "query", (int)strlen(search.query),
+      (int)strlen(search.channelId), search.grid.threadActive);
    setHeading();
+   logInfo("[diag-search] reload heading set; setGridSource begin\n");
    setGridSource(&search.grid, searchFetch, NULL);
+   logInfo("[diag-search] reload setGridSource returned stage=%d threadActive=%d\n",
+      gridStage(&search.grid), search.grid.threadActive);
 }
 
 static void enterChannel(const SearchResult *item)
 {
-   if (!item->channelId[0]) return;
+   logInfo("[diag-triangle] search enterChannel videoId=%s channelIdLen=%d authorLen=%d\n",
+      item ? item->videoId : "NULL", item ? (int)strlen(item->channelId) : 0,
+      item ? (int)strlen(item->author) : 0);
+   if (!item || !item->channelId[0]) { logInfo("[diag-triangle] search enterChannel skipped: missing channelId\n"); return; }
    strCopy(search.channelId, sizeof search.channelId, item->channelId);
    strCopy(search.channelName, sizeof search.channelName, item->author[0] ? item->author : "Channel");
    search.channelSort = CHANNEL_SORT_LATEST;
@@ -108,16 +126,21 @@ static void cycleChannelSort(void)
 
 static void onQueryEntered(const char *text)
 {
-   if (!text || !text[0]) return;
-   if (strstr(text, "youtu")) { stopVideoGrid(&search.grid); playVideo(text); return; }
+   logInfo("[diag-search] search callback entered text=%s len=%d\n", text ? "present" : "NULL", text ? (int)strlen(text) : 0);
+   if (!text || !text[0]) { logInfo("[diag-search] search callback empty; return\n"); return; }
+   if (strstr(text, "youtu")) { logInfo("[diag-search] search URL path: stop grid\n"); stopVideoGrid(&search.grid); logInfo("[diag-search] search URL path: playVideo\n"); playVideo(text); return; }
    search.channelId[0] = 0;   // a search exits channel mode
    strCopy(search.query, sizeof search.query, text);
    search.sort = SORT_RELEVANCE;
+   logInfo("[diag-search] search query stored; reload begin\n");
    reload();
+   logInfo("[diag-search] search callback returned\n");
 }
 
 static void initSearch(void)
 {
+   logInfo("[diag-search] initSearch entered pendingIsChannel=%d pendingQueryLen=%d pendingChannelIdLen=%d\n",
+      pendingIsChannel, (int)strlen(pendingQuery), (int)strlen(pendingChannel.channelId));
    search.screenW = getGfxScreenWidth();
    search.screenH = getGfxScreenHeight();
 
@@ -133,7 +156,9 @@ static void initSearch(void)
       strCopy(search.query, sizeof search.query, pendingQuery);
    }
 
+   logInfo("[diag-search] initSearch opening UI font\n");
    uiFont = openSystemFont(FONT_POP);
+   logInfo("[diag-search] initSearch UI font opened\n");
    initLabel(&titleLabel,  &uiFont, MARGIN_X, HEADER_Y, search.screenW - 300, AUTO, TITLE_SIZE, activeTheme->textPrimary, TEXT_NOWRAP_ELLIPSIS, "");
    initLabel(&sortLabel,   &uiFont, 0, HEADER_Y, AUTO, AUTO, TITLE_SIZE, activeTheme->textSecondary, TEXT_NOWRAP, "");
    initLabel(&statusLabel, &uiFont, MARGIN_X, GRID_TOP, search.screenW - 2 * MARGIN_X, AUTO, 21, activeTheme->textSecondary, TEXT_NOWRAP, "Loading...");
@@ -147,7 +172,10 @@ static void initSearch(void)
    addButtonHint(&hints, getConsoleGlyph(GLYPH_R3),       "Download");
    addButtonHint(&hints, getConsoleGlyph(GLYPH_START),    "Search");
 
+   logInfo("[diag-search] initSearch initVideoGrid begin dimensions=%dx%d\n",
+      search.screenW - 2 * MARGIN_X, search.screenH - GRID_TOP - HINTS_BOTTOM - HINT_GLYPH_H - 24);
    initVideoGrid(&search.grid, &uiFont, MARGIN_X, GRID_TOP, search.screenW - 2 * MARGIN_X, search.screenH - GRID_TOP - HINTS_BOTTOM - HINT_GLYPH_H - 24);
+   logInfo("[diag-search] initSearch initVideoGrid returned\n");
    setGridWatchedPredicate(&search.grid, isWatched);
    setGridWatchLaterPredicate(&search.grid, isWatchLater);
    reload();
@@ -180,8 +208,19 @@ static void updateSearch(void)
    if (isPadButtonPressed(PAD_BTN_SQUARE)) { toggleWatchLater(selected); return; }
    if (isPadButtonPressed(PAD_BTN_R3)) { if (!selected->isLive) enqueueDownload(selected); return; }   // live can't be downloaded
    if (isPadButtonPressed(PAD_BTN_TRIANGLE)) {
-      if (search.channelId[0]) { setSubscribed(search.channelId, !isSubscribed(search.channelId)); updateTriangleHint(); }
-      else enterChannel(selected);
+      logInfo("[diag-triangle] search page mode=%s selectedVideoId=%s selectedChannelIdLen=%d currentChannelIdLen=%d\n",
+         search.channelId[0] ? "channel-listing" : "results", selected->videoId,
+         (int)strlen(selected->channelId), (int)strlen(search.channelId));
+      if (search.channelId[0]) {
+         int wasSubscribed = isSubscribed(search.channelId);
+         logInfo("[diag-triangle] channel listing subscription toggle begin currentlySubscribed=%d\n", wasSubscribed);
+         setSubscribed(search.channelId, !wasSubscribed);
+         updateTriangleHint();
+         logInfo("[diag-triangle] channel listing subscription toggle returned\n");
+      } else {
+         enterChannel(selected);
+         logInfo("[diag-triangle] search enterChannel returned\n");
+      }
       return;
    }
    if (isPadButtonPressed(PAD_BTN_CROSS)) {
@@ -221,16 +260,25 @@ static void termSearch(void)
 
 void openSearchQuery(const char *query)
 {
+   logInfo("[diag-search] openSearchQuery begin queryLen=%d\n", query ? (int)strlen(query) : 0);
    strCopy(pendingQuery, sizeof pendingQuery, query);
    pendingIsChannel = 0;
+   logInfo("[diag-search] openSearchQuery pushScreen begin\n");
    pushScreen(&searchScreen);
+   logInfo("[diag-search] openSearchQuery pushScreen returned\n");
 }
 
 void openChannelFor(const SearchResult *item)
 {
+   logInfo("[diag-triangle] openChannelFor begin item=%s channelIdLen=%d authorLen=%d\n",
+      item ? item->videoId : "NULL", item ? (int)strlen(item->channelId) : 0,
+      item ? (int)strlen(item->author) : 0);
+   if (!item || !item->channelId[0]) { logInfo("[diag-triangle] openChannelFor rejected missing channelId\n"); return; }
    pendingChannel = *item;
    pendingIsChannel = 1;
+   logInfo("[diag-triangle] openChannelFor pushScreen begin\n");
    pushScreen(&searchScreen);
+   logInfo("[diag-triangle] openChannelFor pushScreen returned\n");
 }
 
 Screen searchScreen = { initSearch, NULL, updateSearch, drawSearch, NULL, termSearch, SCREEN_TERMINATED };

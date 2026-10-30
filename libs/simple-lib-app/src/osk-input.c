@@ -1,6 +1,7 @@
 #include "osk-input.h"
 
 #include <stdint.h>
+#include <string.h>
 #include <sys/memory.h>
 #include <sysutil/sysutil_common.h>
 #include <sysutil/sysutil_oskdialog.h>
@@ -40,11 +41,17 @@ static void oskFinish(void)
 
    if (!doneCallback) return;
 
+   logInfo("[diag-search] OSK finish result=%d firstCodeUnit=%u callback=%s\n",
+      (int)ret.result, (unsigned)resultW[0], doneCallback ? "set" : "NULL");
    if (ret.result == CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK && resultW[0] != 0) {
       utf16ToUtf8(resultW, resultUtf8, sizeof resultUtf8);
+      logInfo("[diag-search] OSK converted query len=%d; callback begin\n", (int)strlen(resultUtf8));
       doneCallback(resultUtf8);
+      logInfo("[diag-search] OSK callback returned\n");
    } else {
+      logInfo("[diag-search] OSK empty/cancelled; callback begin\n");
       doneCallback(NULL);  // cancelled or empty
+      logInfo("[diag-search] OSK callback returned\n");
    }
 }
 
@@ -76,6 +83,9 @@ bool oskInputBegin(const char *caption, const char *initialText, OskDoneCallback
    if (active) return true;
 
    doneCallback = onDone;
+   logInfo("[diag-search] OSK begin captionLen=%d initialTextLen=%d callback=%s\n",
+      caption ? (int)strlen(caption) : 0, initialText ? (int)strlen(initialText) : 0,
+      onDone ? "set" : "NULL");
    utf8ToUtf16(caption,     messageW,  OSK_MAX_CHARS);
    utf8ToUtf16(initialText, initTextW, OSK_MAX_CHARS);
    resultW[0] = 0;
@@ -110,5 +120,6 @@ bool oskInputBegin(const char *caption, const char *initialText, OskDoneCallback
    }
 
    active = true;
+   logInfo("[diag-search] OSK load succeeded; active=1\n");
    return true;
 }

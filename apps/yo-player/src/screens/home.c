@@ -19,6 +19,7 @@
 #include "screen-manager.h"
 #include "osk-input.h"
 #include "string-utilities.h"   // strCopy
+#include "dbg.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -341,10 +342,14 @@ static void drawAccountPanel(void)
 // OSK confirmed: a link plays directly, anything else opens a search.
 static void onQueryEntered(const char *text)
 {
-   if (!text || !text[0]) return;
-   if (strstr(text, "youtu")) { stopVideoGrid(&home.grid); playVideo(text); return; }
+   logInfo("[diag-search] home callback entered text=%s len=%d\n", text ? "present" : "NULL", text ? (int)strlen(text) : 0);
+   if (!text || !text[0]) { logInfo("[diag-search] home callback empty; return\n"); return; }
+   if (strstr(text, "youtu")) { logInfo("[diag-search] home URL path: stop grid\n"); stopVideoGrid(&home.grid); logInfo("[diag-search] home URL path: playVideo\n"); playVideo(text); return; }
+   logInfo("[diag-search] home query path: cacheCurrent begin\n");
    cacheCurrent();
+   logInfo("[diag-search] home query path: cacheCurrent done; openSearchQuery begin\n");
    openSearchQuery(text);
+   logInfo("[diag-search] home query path: openSearchQuery returned\n");
 }
 
 static void initHome(void)
@@ -463,7 +468,21 @@ static void updateHome(void)
    }
    if (isPadButtonPressed(PAD_BTN_R3)) { if (!selected->isLive) enqueueDownload(selected); return; }   // live can't be downloaded
    // Recommended tiles don't say which channel they are from
-   if (isPadButtonPressed(PAD_BTN_TRIANGLE)) { if (selected->channelId[0]) { cacheCurrent(); openChannelFor(selected); } return; }
+   if (isPadButtonPressed(PAD_BTN_TRIANGLE)) {
+      logInfo("[diag-triangle] home page=%d selected=%d videoId=%s channelIdLen=%d authorLen=%d\n",
+         home.category, home.grid.selected, selected->videoId,
+         (int)strlen(selected->channelId), (int)strlen(selected->author));
+      if (selected->channelId[0]) {
+         logInfo("[diag-triangle] home cacheCurrent begin\n");
+         cacheCurrent();
+         logInfo("[diag-triangle] home cacheCurrent done; openChannelFor begin\n");
+         openChannelFor(selected);
+         logInfo("[diag-triangle] home openChannelFor returned\n");
+      } else {
+         logInfo("[diag-triangle] home selected item has no channelId; navigation skipped\n");
+      }
+      return;
+   }
    if (isPadButtonPressed(PAD_BTN_CROSS)) {
       markWatched(selected->videoId);
       stopVideoGrid(&home.grid);   // no per-call http fetch may overlap the http media stream during playback
