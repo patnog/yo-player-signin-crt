@@ -160,6 +160,9 @@ static TextTexture descriptionTexture;        // whole description as one tall t
 // the shared pill meter; its level is kept in `volumeLevel` outside `state` so it survives across videos.
 static VolumeMeter volumeMeter;
 static int volumeLevel = VOLUME_DEFAULT;
+// Playback display preference: deliberately outside `state` so it survives between videos.
+// It starts OFF on application launch and is toggled with R2 during playback.
+static int cropToFillEnabled;
 
 static void fail(const char *reason)
 {
@@ -356,6 +359,11 @@ static void nudgeSeek(float deltaSeconds, uint64_t nowUs)
 static void handlePlaybackInput(void)
 {
    uint64_t nowUs = sys_time_get_system_time();
+
+   if (isPadButtonPressed(PAD_BTN_R2)) {
+      cropToFillEnabled = !cropToFillEnabled;
+      showToast(cropToFillEnabled ? "Crop to fill: ON" : "Crop to fill: OFF");
+   }
 
    if (isPadButtonPressed(PAD_BTN_CROSS)) {
       if (isVideoEnded(state.player)) seekVideoPlayer(state.player, 0.0f);
@@ -771,6 +779,26 @@ static void drawToast(void)
    drawBadge(&toastLabel, state.screenW - 40 - (toastLabel.tt.tex.w + 2 * BADGE_PAD_X), 80);
 }
 
+// Fill the display while preserving the source aspect ratio. Any excess image area is
+// positioned outside the screen and clipped by the RSX viewport (a centred crop).
+static void getCropToFillRect(int frameW, int frameH, int *dx, int *dy, int *dw, int *dh)
+{
+   float frameAspect = (float)frameW / (float)frameH;
+   float screenAspect = (float)state.screenW / (float)state.screenH;
+
+   if (frameAspect > screenAspect) {
+      *dh = state.screenH;
+      *dw = (int)(state.screenH * frameAspect + 0.5f);
+      *dx = (state.screenW - *dw) / 2;
+      *dy = 0;
+   } else {
+      *dw = state.screenW;
+      *dh = (int)(state.screenW / frameAspect + 0.5f);
+      *dx = 0;
+      *dy = (state.screenH - *dh) / 2;
+   }
+}
+
 static void drawPlay(void)
 {
    // The SD UI zoom is intended for library/navigation screens only. Keep all playback
@@ -788,7 +816,8 @@ static void drawPlay(void)
          if (!state.firstFrameSeen) showControls();   // bring up the HUD as playback starts; it auto-hides as usual
          state.firstFrameSeen = 1;
          int dx, dy, dw, dh;
-         getGfxLetterboxRect(w, h, &dx, &dy, &dw, &dh);
+         if (cropToFillEnabled) getCropToFillRect(w, h, &dx, &dy, &dw, &dh);
+         else                   getGfxLetterboxRect(w, h, &dx, &dy, &dw, &dh);
          drawGfxYuvFrame(dx, dy, dw, dh, frame, w, h);
       }
       measureFps(frame);
