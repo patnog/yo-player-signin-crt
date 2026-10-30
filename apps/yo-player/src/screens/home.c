@@ -109,6 +109,12 @@ static void loadSdScale(void)
 static void cycleSdScale(void)
 {
    if (!isGfxSdVideoOutput()) return;
+   // Keep this index synchronized when the channel screen changes the shared scale.
+   float current = getGfxUiScaleFactor();
+   for (int i = 0; i < SD_SCALE_COUNT; i++) {
+      float diff = current - SdScaleChoices[i];
+      if (diff > -0.001f && diff < 0.001f) { sdScaleIndex = i; break; }
+   }
    sdScaleIndex = (sdScaleIndex + 1) % SD_SCALE_COUNT;
    setGfxSdUiScale(SdScaleChoices[sdScaleIndex]);
    char buf[32];

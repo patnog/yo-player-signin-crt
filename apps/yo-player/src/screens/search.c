@@ -29,6 +29,12 @@
 #define HINTS_BOTTOM  88
 #define HINT_GLYPH_H  28
 #define HINT_TEXT     22
+#define SD_HINTS_BOTTOM 100
+#define SD_HINT_ROW_GAP 8
+#define SD_MAX_SCALE 1.5f
+#define SD_SCALE_PATH "/dev_hdd0/tmp/yo-player/sd-ui-scale.txt"
+#define SD_SCALE_COUNT 2
+static const float SdScaleChoices[SD_SCALE_COUNT] = { 1.00f, 1.50f };
 #define TRIANGLE_HINT 3         // Triangle's slot in the hint row (see initSearch): retitled per mode
 
 static const char *SortNames[SORT_COUNT]                = { "Relevance", "Views" };
@@ -52,7 +58,9 @@ static struct {
 
 static Font        uiFont;
 static Label       titleLabel, sortLabel, statusLabel;
-static ButtonHints hints;
+static ButtonHints hints, hintsSecondRow;
+static int sdHintsTwoRows;
+static int scaleHint = -1;
 
 static int searchFetch(const char *token, SearchResults *out, void *user)
 {
@@ -73,6 +81,30 @@ static int searchFetch(const char *token, SearchResults *out, void *user)
 }
 
 // in channel mode Triangle toggles the subscription (you're already in the channel); elsewhere it drills in.
+static void refreshScaleHint(void)
+{
+   if (!sdHintsTwoRows || scaleHint < 0) return;
+   char caption[32];
+   snprintf(caption, sizeof caption, "Scale %.1fx", (double)getGfxUiScaleFactor());
+   setButtonHintCaption(&hintsSecondRow, scaleHint, caption);
+}
+
+static void cycleSdScale(void)
+{
+   float current = getGfxUiScaleFactor();
+   int index = 0;
+   for (int i = 0; i < SD_SCALE_COUNT; i++) {
+      float diff = current - SdScaleChoices[i];
+      if (diff > -0.001f && diff < 0.001f) { index = i; break; }
+   }
+   index = (index + 1) % SD_SCALE_COUNT;
+   setGfxSdUiScale(SdScaleChoices[index]);
+   char buf[16];
+   int n = snprintf(buf, sizeof buf, "%.2f\n", (double)SdScaleChoices[index]);
+   if (n > 0) writeFile(SD_SCALE_PATH, buf, (uint64_t)n);
+   refreshScaleHint();
+}
+
 static void updateTriangleHint(void)
 {
    const char *caption = "Channel";
@@ -160,17 +192,40 @@ static void initSearch(void)
    uiFont = openSystemFont(FONT_POP);
    logInfo("[diag-search] initSearch UI font opened\n");
    initLabel(&titleLabel,  &uiFont, MARGIN_X, HEADER_Y, search.screenW - 300, AUTO, TITLE_SIZE, activeTheme->textPrimary, TEXT_NOWRAP_ELLIPSIS, "");
+   setLabelScaleWithUi(&titleLabel, 1);
    initLabel(&sortLabel,   &uiFont, 0, HEADER_Y, AUTO, AUTO, TITLE_SIZE, activeTheme->textSecondary, TEXT_NOWRAP, "");
    initLabel(&statusLabel, &uiFont, MARGIN_X, GRID_TOP, search.screenW - 2 * MARGIN_X, AUTO, 21, activeTheme->textSecondary, TEXT_NOWRAP, "Loading...");
 
-   initButtonHints(&hints, &uiFont, search.screenH - HINTS_BOTTOM, HINT_GLYPH_H, HINT_TEXT, activeTheme->textSecondary);
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_CROSS),    "Play");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_CIRCLE),   "Back");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_SQUARE),   "Watch Later");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_TRIANGLE), "Channel");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_SELECT),   "Sort");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_R3),       "Download");
-   addButtonHint(&hints, getConsoleGlyph(GLYPH_START),    "Search");
+   sdHintsTwoRows = isGfxSdVideoOutput();
+   if (sdHintsTwoRows) {
+      int maxGlyphHeight = (int)(HINT_GLYPH_H * SD_MAX_SCALE + 0.5f);
+      initButtonHints(&hints, &uiFont,
+                      search.screenH - SD_HINTS_BOTTOM - maxGlyphHeight - SD_HINT_ROW_GAP,
+                      HINT_GLYPH_H, HINT_TEXT, activeTheme->textSecondary);
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_CROSS),    "Play");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_CIRCLE),   "Back");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_SQUARE),   "Watch Later");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_TRIANGLE), "Channel");
+      setButtonHintsStableLayout(&hints, 1);
+
+      initButtonHints(&hintsSecondRow, &uiFont, search.screenH - SD_HINTS_BOTTOM,
+                      HINT_GLYPH_H, HINT_TEXT, activeTheme->textSecondary);
+      addButtonHint(&hintsSecondRow, getConsoleGlyph(GLYPH_SELECT), "Sort");
+      addButtonHint(&hintsSecondRow, getConsoleGlyph(GLYPH_R3),     "Download");
+      addButtonHint(&hintsSecondRow, getConsoleGlyph(GLYPH_START),  "Search");
+      scaleHint = addButtonHint(&hintsSecondRow, getConsoleGlyph(GLYPH_L2), "Scale 1.5x");
+      setButtonHintsStableLayout(&hintsSecondRow, 1);
+      refreshScaleHint();
+   } else {
+      initButtonHints(&hints, &uiFont, search.screenH - HINTS_BOTTOM, HINT_GLYPH_H, HINT_TEXT, activeTheme->textSecondary);
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_CROSS),    "Play");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_CIRCLE),   "Back");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_SQUARE),   "Watch Later");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_TRIANGLE), "Channel");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_SELECT),   "Sort");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_R3),       "Download");
+      addButtonHint(&hints, getConsoleGlyph(GLYPH_START),    "Search");
+   }
 
    logInfo("[diag-search] initSearch initVideoGrid begin dimensions=%dx%d\n",
       search.screenW - 2 * MARGIN_X, search.screenH - GRID_TOP - HINTS_BOTTOM - HINT_GLYPH_H - 24);
@@ -185,6 +240,11 @@ static void updateSearch(void)
 {
    updateDownloadOverlay();
    if (oskInputActive()) return;
+
+   if (search.channelId[0] && isPadButtonPressed(PAD_BTN_L2) && isGfxSdVideoOutput()) {
+      cycleSdScale();
+      return;
+   }
 
    if (isPadButtonPressed(PAD_BTN_START)) { oskInputBegin("Search YouTube", search.query[0] ? search.query : "", onQueryEntered); }
 
@@ -232,6 +292,7 @@ static void updateSearch(void)
 
 static void drawSearch(void)
 {
+   refreshLabelScale(&titleLabel);
    fillGfxRectangle(0, 0, search.screenW, search.screenH, activeTheme->appBg);
    drawLabel(&titleLabel);
    moveLabel(&sortLabel, search.screenW - MARGIN_X - sortLabel.tt.tex.w, HEADER_Y);   // right-aligned
@@ -245,6 +306,7 @@ static void drawSearch(void)
    }
 
    drawButtonHints(&hints, search.screenW);
+   if (sdHintsTwoRows) drawButtonHints(&hintsSecondRow, search.screenW);
    drawDownloadOverlay(search.screenW);
 }
 
@@ -252,6 +314,7 @@ static void termSearch(void)
 {
    termVideoGrid(&search.grid);
    termButtonHints(&hints);
+   termButtonHints(&hintsSecondRow);
    freeLabel(&titleLabel);
    freeLabel(&sortLabel);
    freeLabel(&statusLabel);
