@@ -425,6 +425,40 @@ static int fetchPlayer(const char *bodyFmt, const char *userAgent, const char *c
    return 0;
 }
 
+// Resolve only the video's channel metadata. This is intentionally separate from feed parsing
+// and playback extraction so account tiles pay the request cost only when Triangle is pressed.
+static int youtubeGetVideoChannelId(const char *videoId, char *channelId, int channelIdCap)
+{
+   if (!videoId || !videoId[0] || !channelId || channelIdCap < 3) return -1;
+   channelId[0] = 0;
+   if (ensureVisitorData() != 0) {
+      logError("[yt] channel lookup: visitor session unavailable for %s\n", videoId);
+      return -1;
+   }
+
+   char *resp = malloc(RESP_CAP);
+   if (!resp) return -1;
+
+   int respLen = 0;
+   int rc = fetchPlayer(PLAYER_BODY_FMT, PLAYER_UA, "101", PLAYER_VERSION, videoId, resp, &respLen);
+   if (rc != 0) {
+      logError("[yt] channel lookup: player request failed video=%s rc=%d\n", videoId, rc);
+      free(resp);
+      return rc;
+   }
+
+   const char *end = resp + respLen;
+   const char *details = strstr(resp, "\"videoDetails\"");
+   int found = details && jsonString(details, end, "channelId", channelId, channelIdCap)
+               && channelId[0] == 'U' && channelId[1] == 'C';
+   if (!found) {
+      channelId[0] = 0;
+      logError("[yt] channel lookup: videoDetails.channelId missing video=%s\n", videoId);
+   }
+   free(resp);
+   return found ? 0 : -1;
+}
+
 static int extract(const char *input, StreamInfo *out)
 {
    memset(out, 0, sizeof *out);
@@ -755,4 +789,6 @@ static int fetchAccountFeed(AccountFeed feed, const char *continuation, SearchRe
    return 0;
 }
 
-const Extractor youtubeExtractor = { "youtube", matches, extract, search, fetchTrending, getChannel, fetchAccountFeed };
+const Extractor youtubeExtractor = {
+   "youtube", matches, extract, search, fetchTrending, getChannel, fetchAccountFeed, youtubeGetVideoChannelId
+};

@@ -5,6 +5,7 @@
 #include "screens/play.h"
 #include "video-grid.h"
 #include "storage.h"
+#include "extractor.h"
 #include "vfs.h"
 #include "account.h"
 #include "downloads.h"
@@ -472,15 +473,21 @@ static void updateHome(void)
       logInfo("[diag-triangle] home page=%d selected=%d videoId=%s channelIdLen=%d authorLen=%d\n",
          home.category, home.grid.selected, selected->videoId,
          (int)strlen(selected->channelId), (int)strlen(selected->author));
-      if (selected->channelId[0]) {
-         logInfo("[diag-triangle] home cacheCurrent begin\n");
-         cacheCurrent();
-         logInfo("[diag-triangle] home cacheCurrent done; openChannelFor begin\n");
-         openChannelFor(selected);
-         logInfo("[diag-triangle] home openChannelFor returned\n");
-      } else {
-         logInfo("[diag-triangle] home selected item has no channelId; navigation skipped\n");
+      SearchResult channelItem = *selected;
+      if (!channelItem.channelId[0]) {
+         logInfo("[home] Triangle: resolving channel for video=%s\n", channelItem.videoId);
+         if (getVideoChannelId(channelItem.videoId, channelItem.channelId, sizeof channelItem.channelId) != 0) {
+            logError("[home] Triangle: channel lookup failed; navigation skipped video=%s\n", channelItem.videoId);
+            return;
+         }
+         logInfo("[home] Triangle: resolved channelId=%s\n", channelItem.channelId);
       }
+
+      logInfo("[diag-triangle] home cacheCurrent begin\n");
+      cacheCurrent();
+      logInfo("[diag-triangle] home cacheCurrent done; openChannelFor begin\n");
+      openChannelFor(&channelItem);
+      logInfo("[diag-triangle] home openChannelFor returned\n");
       return;
    }
    if (isPadButtonPressed(PAD_BTN_CROSS)) {

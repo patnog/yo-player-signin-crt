@@ -118,6 +118,8 @@ typedef struct Extractor {
    int (*getChannel)(const char *channelId, const char *token, SearchResults *out);
    // a signed-in account feed. continuation as for search. -1 when signed out.
    int (*getAccountFeed)(AccountFeed feed, const char *continuation, SearchResults *out);
+   // Resolve a video's owning channel without fetching playback formats.
+   int (*getVideoChannelId)(const char *videoId, char *channelId, int channelIdCap);
 } Extractor;
 
 // picks the first registered extractor that claims input, or NULL.
@@ -136,3 +138,6 @@ int getChannelVideos(const char *channelId, const char *token, SearchResults *ou
 // a signed-in account feed (see AccountFeed). continuation as above. 0 ok; negative on error or when
 // signed out. blocking: call from a worker thread.
 int getAccountFeed(AccountFeed feed, const char *continuation, SearchResults *out);
+
+// Resolve a video's owning channel ID on demand. Blocking network request.
+int getVideoChannelId(const char *videoId, char *channelId, int channelIdCap);

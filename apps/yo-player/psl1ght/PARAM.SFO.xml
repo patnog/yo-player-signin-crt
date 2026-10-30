@@ -10,7 +10,7 @@
   <value name="PS3_SYSTEM_VER" type="string">04.7500</value>
   <value name="RESOLUTION" type="integer">63</value>
   <value name="SOUND_FORMAT" type="integer">279</value>
-  <value name="TITLE" type="string">Yo! Player (PSL1GHT)</value>
+  <value name="TITLE" type="string">Yo! Player CRT</value>
   <value name="TITLE_ID" type="string">YOPSL0001</value>
   <value name="VERSION" type="string">01.00</value>
 </sfo>

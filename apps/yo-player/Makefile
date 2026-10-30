@@ -21,7 +21,7 @@ CFILES := main.c home.c play.c search.c video-grid.c storage.c stream-select.c \
           subtitles.c chapters.c settings.c theme.c \
           account.c account-oauth.c youtube-tv.c
 
-TITLE     := Yo! Player (PSL1GHT)
+TITLE     := Yo! Player CRT
 APPID     := YOPSL0001
 CONTENTID := UP0001-$(APPID)_00-0000000000000000
 ICON0     := $(CURDIR)/ICON0.PNG
