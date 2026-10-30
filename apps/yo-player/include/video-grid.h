@@ -40,7 +40,8 @@ typedef struct {
    Font            *font;
    int              x, y, width, height;                   // grid rectangle on screen
    int              columns, gap, tileTextH, metaOffset;   // mode-specific layout
-   int              titleSize, metaSize;                   // base label sizes; SD labels rasterise larger\n   float            labelScale;                            // last scale used to rasterise visible tile labels
+   int              titleSize, metaSize;                   // base label sizes; SD labels rasterise larger
+   float            labelScale;                            // last scale used to rasterise visible tile labels
    int              tileW, thumbH, rowStep, visibleRows;   // derived geometry
 
    SearchResults    results;

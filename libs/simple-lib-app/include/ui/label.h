@@ -17,8 +17,8 @@ typedef struct {
    uint32_t color;
    TextWrap wrap;
    int raw;   // skip {i}/{b}/{color=} style-tag parsing - see initLabelRaw
+   int scaleWithUi; // rerasterise using the selected UI scale
    float renderedScale; // font-scale factor used to build tt; refreshed on draw after L2 changes
-   int scaleWithUi; // rerasterise this label using the selected SD UI scale
    char text[LABEL_MAX_TEXT];
 } Label;
 
