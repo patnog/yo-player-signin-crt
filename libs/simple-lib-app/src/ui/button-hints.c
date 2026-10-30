@@ -39,14 +39,47 @@ void setButtonHintCaption(ButtonHints *bar, int index, const char *caption)
    hint->width = hint->drawWidth + (hint->pairNext ? 0 : ICON_GAP + hint->caption.tt.tex.w);
 }
 
-static int drawHint(ButtonHints *bar, ButtonHint *hint, int x)
+// UI geometry is transformed by gfx.c after these coordinates are submitted.
+// Stable SD hint rows compensate their anchors and spacing before drawing so
+// the enlarged glyphs/captions remain inside the screen-safe footer area.
+static float hintScale(const ButtonHints *bar)
 {
-   int rowMid = bar->y + bar->glyphHeight / 2;
+   float scale = bar->stableLayout ? getGfxUiScaleFactor() : 1.0f;
+   return scale < 1.0f ? 1.0f : scale;
+}
+
+static int hintIconGap(const ButtonHints *bar)
+{
+   float scale = hintScale(bar);
+   return bar->stableLayout ? (int)(ICON_GAP / scale + 0.5f) : ICON_GAP;
+}
+
+static int hintRowGap(const ButtonHints *bar, int paired)
+{
+   int base = paired ? PAIR_GAP : (bar->gap > 0 ? bar->gap : HINT_GAP);
+   float scale = hintScale(bar);
+   return bar->stableLayout ? (int)(base / scale + 0.5f) : base;
+}
+
+static int hintDrawY(const ButtonHints *bar)
+{
+   if (!bar->stableLayout) return bar->y;
+   float scale = hintScale(bar);
+   int screenH = getGfxScreenHeight();
+   float center = screenH * 0.5f;
+   // Keep the rendered top edge at the caller's reserved footer coordinate;
+   // the glyph and caption themselves still grow with the selected zoom.
+   return (int)(center + (bar->y - center) / scale + 0.5f);
+}
+
+static int drawHint(ButtonHints *bar, ButtonHint *hint, int x, int y)
+{
+   int rowMid = y + bar->glyphHeight / 2;
    if (hint->glyph.offset)
-      drawGfxTexture(x, bar->y, hint->drawWidth, bar->glyphHeight, hint->glyph, 0, 0, 1, 1, 0xFFFFFFFF, GFX_FILTER_LINEAR);
+      drawGfxTexture(x, y, hint->drawWidth, bar->glyphHeight, hint->glyph, 0, 0, 1, 1, 0xFFFFFFFF, GFX_FILTER_LINEAR);
    x += hint->drawWidth;
    if (hint->pairNext) return x;   // glyph only - the caption belongs to the hint it pairs with
-   x += ICON_GAP;
+   x += hintIconGap(bar);
    moveLabel(&hint->caption, x, rowMid - hint->caption.tt.tex.h / 2);
    drawLabel(&hint->caption);
    return x + hint->caption.tt.tex.w;
@@ -71,11 +104,12 @@ void setButtonHintShown(ButtonHints *bar, int index, int shown)
 
 void drawButtonHintsAt(ButtonHints *bar, int x)
 {
+   int y = hintDrawY(bar);
    for (int i = 0; i < bar->count; i++) {
       if (bar->hints[i].hidden) continue;
 
-      x = drawHint(bar, &bar->hints[i], x);
-      x += bar->hints[i].pairNext ? PAIR_GAP : (bar->gap > 0 ? bar->gap : HINT_GAP);
+      x = drawHint(bar, &bar->hints[i], x, y);
+      x += hintRowGap(bar, bar->hints[i].pairNext);
    }
 }
 
@@ -85,8 +119,10 @@ void drawButtonHints(ButtonHints *bar, int screenWidth)
    for (int i = 0; i < bar->count; i++) {
       if (bar->hints[i].hidden) continue;
 
-      total += bar->hints[i].width;
-      if (i < bar->count - 1) total += bar->hints[i].pairNext ? PAIR_GAP : (bar->gap > 0 ? bar->gap : HINT_GAP);
+      ButtonHint *hint = &bar->hints[i];
+      total += hint->drawWidth;
+      if (!hint->pairNext) total += hintIconGap(bar) + hint->caption.tt.tex.w;
+      if (i < bar->count - 1) total += hintRowGap(bar, hint->pairNext);
    }
 
    drawButtonHintsAt(bar, (screenWidth - total) / 2);
