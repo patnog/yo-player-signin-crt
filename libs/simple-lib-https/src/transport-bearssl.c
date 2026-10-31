@@ -39,6 +39,7 @@ static TlsConn *checkoutConn(const char *host)
    for (int i = 0; i < POOL_SIZE; i++)
       if (pool[i] && strcmp(getTlsHost(pool[i]), host) == 0) { found = pool[i]; pool[i] = NULL; break; }
    unlock(&poolLock);
+   logInfo("[tls-diag] pool checkout host=%s result=%s conn=%p\n", host, found ? "hit" : "miss", found);
    return found;
 }
 
@@ -52,6 +53,8 @@ static void checkinConn(TlsConn *conn)
          if (!pool[i]) { pool[i] = conn; parked = 1; break; }
       unlock(&poolLock);
    }
+   logInfo("[tls-diag] pool checkin host=%s conn=%p result=%s\n",
+           getTlsHost(conn), conn, parked ? "parked" : "closed-pool-full-or-disabled");
    if (!parked) closeTlsConn(conn);
 }
 
@@ -71,13 +74,22 @@ static TlsConn *sendReusable(const char *host, const char *path, const char *met
          logInfo("[tls] opening a new connection to %s\n", host);   // a fresh handshake, not a reused one
          conn = openTlsConn(host);
       }
-      if (!conn) return NULL;
+      if (!conn) {
+         logError("[tls-diag] connection open failed host=%s attempt=%d reused=%d\n", host, attempt, reused);
+         return NULL;
+      }
 
-      if (sendTlsRequest(conn, method, version, keepAlive, host, path, headerBlock, body, bodyLen) == 0 &&
-          readTlsHead(conn, status, total) == 0)
+      int sendRc = sendTlsRequest(conn, method, version, keepAlive, host, path, headerBlock, body, bodyLen);
+      int headRc = sendRc == 0 ? readTlsHead(conn, status, total) : -2;
+      if (sendRc == 0 && headRc == 0) {
+         logInfo("[tls-diag] request ok host=%s conn=%p reused=%d status=%d total=%llu\n",
+                 host, conn, reused, status ? *status : 0, (unsigned long long)(total ? *total : 0));
          return conn;
+      }
 
-      if (!reused) { logError("[tls] %s: request failed (bearssl err=%d)\n", host, getLastTlsError(conn)); closeTlsConn(conn); return NULL; }
+      logError("[tls-diag] request failed host=%s conn=%p reused=%d sendRc=%d headRc=%d bearssl=%d\n",
+               host, conn, reused, sendRc, headRc, getLastTlsError(conn));
+      if (!reused) { closeTlsConn(conn); return NULL; }
       closeTlsConn(conn);
       logWarn("[tls] reused %s went stale, retrying fresh\n", host);   // loop retries with a fresh connection
    }

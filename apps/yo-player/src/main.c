@@ -114,6 +114,13 @@ int main(int argc, char **argv)
    BOOT_MARK("rtc\n");
    initVfs();                    // file i/o routing (the temp download lands via openFs)
    BOOT_MARK("vfs\n");
+
+   // Start each application run with a fresh diagnostic log. Do this after
+   // VFS initialization and before the first logBuildVersion() call.
+   VfsFile logFile;
+   if (openFs(DBG_LOG, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC, &logFile) == 0)
+      closeFs(&logFile);
+
    logBuildVersion();
    initTheme();                  // palette from themes.txt: every colour below reads activeTheme
    BOOT_MARK("theme\n");

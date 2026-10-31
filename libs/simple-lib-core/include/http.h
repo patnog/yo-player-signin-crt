@@ -44,6 +44,7 @@ typedef struct HttpStream HttpStream;
 
 HttpStream *openHttpStream(const char *url);                                    // NULL on failure
 int64_t     readHttpStream(HttpStream *stream, void *buffer, uint64_t length);  // bytes read, 0 eof, -1 err
+void        cancelHttpStream(HttpStream *stream);                               // wake a blocked reader during teardown
 int         seekHttpStream(HttpStream *stream, uint64_t offset);                // absolute seek; 0 / -1
 uint64_t    getHttpStreamSize(HttpStream *stream);                             // total size (0 if unknown)
 void        closeHttpStream(HttpStream *stream);

@@ -31,6 +31,11 @@ void         destroyVideoPlayer(VideoPlayer *player);
 // reading a buffer the decoder is refilling). Fills *width/*height with the coded plane dimensions.
 const uint8_t *getVideoFrame(VideoPlayer *player, int *width, int *height);
 
+int   isVideoPlayerReady(const VideoPlayer *player);
+int   isVideoPlayerUsingSeparateAudio(const VideoPlayer *player);
+int   isVideoPlayerSeparateAudioAlive(const VideoPlayer *player);
+void  setVideoPlayerAudioVolume(VideoPlayer *player, float volume);
+int   replaceVideoPlayerAudio(VideoPlayer *player, const char *audioPath, float positionSeconds);
 void  setVideoPaused(VideoPlayer *player, int paused);
 int   isVideoPaused(const VideoPlayer *player);
 // asynchronous seek: decode restarts from the nearest cued keyframe at or before `seconds` (both

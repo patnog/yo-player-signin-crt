@@ -190,6 +190,7 @@ static int extractVideoId(const char *input, char *out, int cap)
 static void parseFormatArray(const char *arrayStart, const char *regionEnd, int progressive, StreamInfo *out)
 {
    const char *scan = arrayStart;
+   int diagnosticCount = 0;
    while (out->formatCount < MAX_STREAM_FORMATS) {
       const char *object = strstr(scan, "\"itag\":");
       if (!object || object >= regionEnd) break;
@@ -210,9 +211,31 @@ static void parseFormatArray(const char *arrayStart, const char *regionEnd, int 
       // and picking one of those over a real avc1 stream made the video fail to open.
       char mimeType[64] = "";
       jsonString(object, objectEnd, "mimeType", mimeType, sizeof mimeType);
+      // Adaptive audio formats identify the language and whether YouTube marked it as original/auto-dubbed.
+      const char *audioTrack = strstr(object, "\"audioTrack\":{");
+      if (audioTrack && audioTrack < objectEnd) {
+         // displayName can itself contain nested JSON objects. Do not stop at its first closing
+         // brace: that truncated the metadata before audioIsDefault/isAutoDubbed on some responses.
+         jsonString(audioTrack, objectEnd, "id", format->audioTrackId, sizeof format->audioTrackId);
+         jsonString(audioTrack, objectEnd, "displayName", format->audioTrackName, sizeof format->audioTrackName);
+         const char *flag = strstr(audioTrack, "\"audioIsDefault\":true");
+         format->audioIsDefault = flag && flag < objectEnd;
+         flag = strstr(audioTrack, "\"isAutoDubbed\":true");
+         format->audioIsAutoDubbed = flag && flag < objectEnd;
+      }
       strCopy(format->container, sizeof format->container, strstr(mimeType, "webm") ? "webm" : "mp4");
       int isAvc = strstr(mimeType, "avc1") != NULL || strstr(mimeType, "avc3") != NULL;
       int isAac = strstr(mimeType, "mp4a") != NULL;
+      // Temporary diagnostics: log at most 128 raw entries per formats array,
+      // including entries discarded below because their codec is unsupported.
+      if (diagnosticCount < 128) {
+         logInfo("[yt] rawfmt[%d] itag=%d mime=%s url=%d cipher=%d size=%dx%d fps=%d avc=%d aac=%d progressive=%d audioId='%s' name='%s' default=%d autoDubbed=%d\n",
+                 diagnosticCount, format->itag, mimeType, format->url[0] != 0,
+                 format->needsCipher, format->width, format->height, format->fps,
+                 isAvc, isAac, progressive, format->audioTrackId, format->audioTrackName,
+                 format->audioIsDefault, format->audioIsAutoDubbed);
+         diagnosticCount++;
+      }
       if (progressive)                              format->hasVideo = format->hasAudio = 1;
       else if (strncmp(mimeType, "audio/", 6) == 0) format->hasAudio = isAac;
       else                                          format->hasVideo = isAvc;
@@ -483,6 +506,20 @@ static int extract(const char *input, StreamInfo *out)
    if (jsonString(details ? details : resp, end, "lengthSeconds", lenText, sizeof lenText))
       out->durationSeconds = atoi(lenText);
    parseCaptionTracks(resp, end, out);
+   // Resolve the default audio ID from captions.playerCaptionsTracklistRenderer.audioTracks.
+   {
+      const char *audioTracks = strstr(resp, "\"audioTracks\":[");
+      int defaultIndex = -1;
+      if (audioTracks && jsonInt(resp, end, "defaultAudioTrackIndex", &defaultIndex) && defaultIndex >= 0) {
+         const char *scan = audioTracks;
+         for (int i = 0; i <= defaultIndex; i++) {
+            const char *id = strstr(scan, "\"audioTrackId\":\"");
+            if (!id || id >= end) break;
+            if (i == defaultIndex) jsonString(id, end, "audioTrackId", out->defaultAudioTrackId, sizeof out->defaultAudioTrackId);
+            scan = id + 1;
+         }
+      }
+   }
 
    // a live stream (isLive:true) is a rolling DVR window played from the DASH manifest's segment template.
    // VISIONOS only returns an HLS manifest for live, so re-resolve with ANDROID_VR for the DASH one before

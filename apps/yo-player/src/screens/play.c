@@ -26,7 +26,6 @@
 #include "string-utilities.h"   // strCopy
 
 #include "video-player.h"
-#include "audio.h"              // setAudioPcmFeedVolume
 #include "http.h"               // cancel network I/O before joining playback workers
 #include "storage.h"            // resume position (get/setWatchedPosition)
 #include "settings.h"           // sponsorblock-mode (which segment categories auto-skip)
@@ -53,6 +52,7 @@
 // subtitles: triangle cycles off -> track 1 -> track 2 -> ... -> off; the active cue draws above the
 // seek bar, and the HUD shows the chosen language top-right while the controls are up.
 #define SUBTITLE_TEXT_SIZE 30
+#define MAX_AUDIO_TRACKS 128
 
 // description overlay: SELECT toggles the description full-screen; up/down scroll it.
 #define DESCRIPTION_MARGIN_X    120
@@ -108,6 +108,35 @@ static struct {
    int              chapterTimeWidth;    // widest time label (the right-aligned time column)
    int              chapterPanelWidth;
    int              vidItag, vidW, vidH, vidFps, audItag;   // picked formats (worker sets, UI reads)
+   char             videoUrls[3][MAX_STREAM_URL];
+   char             fallbackAudioUrl[MAX_STREAM_URL];
+   int              videoItags[3], videoWidths[3], videoHeights[3], videoFps[3];
+   int              videoHasAudio[3];
+   int              fallbackAudioItag;
+   int              videoAvailable[3], resolutionIndex;
+   VideoPlayer     *pendingResolutionPlayer;
+   VideoPlayer     *retiringResolutionPlayer;
+   volatile int     resolutionSwitchDone;
+   int              resolutionSwitchThreadActive, resolutionSwitchWasPaused, resolutionSwitchWasFirstFrameSeen;
+   int              resolutionSwitchTarget, resolutionSwitchOldIndex, resolutionSwitchRestored;
+   volatile int     resolutionSwitchAborting;
+   float            resolutionSwitchPosition;
+   char             resolutionSwitchVideoUrl[MAX_STREAM_URL];
+   char             resolutionSwitchAudioUrl[MAX_STREAM_URL];
+   char             resolutionSwitchOldVideoUrl[MAX_STREAM_URL];
+   char             resolutionSwitchOldAudioUrl[MAX_STREAM_URL];
+   sys_ppu_thread_t resolutionSwitchTid;
+   char             audioUrls[MAX_AUDIO_TRACKS][MAX_STREAM_URL];
+   char             audioNames[MAX_AUDIO_TRACKS][64];
+   char             audioIds[MAX_AUDIO_TRACKS][40];
+   int              audioItags[MAX_AUDIO_TRACKS];
+   int              audioCount, audioPick;
+   volatile int     audioSwitchDone;
+   int              audioSwitchThreadActive, audioSwitchWasPaused;
+   int              audioFallbackAttempted;
+   sys_ppu_thread_t audioSwitchTid;
+   float            audioSwitchPosition;
+   int              audioSwitchTarget, audioSwitchFallback;
    int              isLive;           // a live stream: no duration, no resume/save, no seek
    const uint8_t   *lastFrame;        // fps measure: a changed pointer means a newly presented frame
    int              framesThisSecond, measuredFps;
@@ -164,6 +193,22 @@ static int volumeLevel = VOLUME_DEFAULT;
 // It starts OFF on application launch and is toggled with R2 during playback.
 static int cropToFillEnabled;
 
+static const StreamFormat *pickAudioForTrack(const StreamInfo *info, const char *trackId)
+{
+   const StreamFormat *best = NULL;
+   int originalOnly = trackId && strcmp(trackId, "__original_upload__") == 0;
+   for (int i = 0; i < info->formatCount; i++) {
+      const StreamFormat *f = &info->formats[i];
+      if (!f->hasAudio || f->hasVideo || f->needsCipher || !f->url[0] || strcmp(f->container, "mp4") != 0) continue;
+      if (originalOnly) {
+         // YouTube commonly omits audioTrack metadata on the uploaded/original AAC rendition.
+         if (f->audioTrackId[0] || f->audioIsAutoDubbed) continue;
+      } else if (trackId && trackId[0] && strcmp(f->audioTrackId, trackId) != 0) continue;
+      if (!best || f->itag == 140) best = f;
+   }
+   return best;
+}
+
 static void fail(const char *reason)
 {
    logError("[yt] play failed: %s\n", reason);
@@ -187,7 +232,7 @@ static int isRenderableSubtitleLanguage(const char *code)
 static void worker(uint64_t arg)
 {
    (void)arg;
-   StreamInfo *info = malloc(sizeof *info);   // ~50 KB, too big for the stack
+   StreamInfo *info = malloc(sizeof *info);   // large format/URL table; keep it off the stack
    const Extractor *extractor = findExtractor(requestedInput);
    if (!info || !extractor) { fail("unrecognised link or id"); goto done; }
 
@@ -202,17 +247,138 @@ static void worker(uint64_t arg)
 
    const StreamFormat *video = pickBestVideo(info);
    if (!video) { fail("no playable mp4 video"); goto done; }
+   for (int profile = 0; profile < 3; profile++) {
+      const StreamFormat *candidate = pickVideoForProfile(info, profile);
+      if (!candidate) continue;
+      strCopy(state.videoUrls[profile], sizeof state.videoUrls[profile], candidate->url);
+      state.videoItags[profile] = candidate->itag;
+      state.videoWidths[profile] = candidate->width;
+      state.videoHeights[profile] = candidate->height;
+      state.videoFps[profile] = candidate->fps;
+      state.videoHasAudio[profile] = candidate->hasAudio;
+      state.videoAvailable[profile] = 1;
+   }
    // a muxed pick (itag 18) already carries audio; a video-only pick needs a separate audio track
    const StreamFormat *audio = video->hasAudio ? NULL : pickBestAudio(info);
+   if (!audio && video->hasAudio) {
+      const StreamFormat *fallbackAudio = pickBestAudio(info);
+      if (fallbackAudio) {
+         strCopy(state.fallbackAudioUrl, sizeof state.fallbackAudioUrl, fallbackAudio->url);
+         state.fallbackAudioItag = fallbackAudio->itag;
+      }
+   }
+   if (video->hasAudio && !state.fallbackAudioUrl[0]) {
+      // If there is no separate AAC rendition to carry across a switch, only offer
+      // profiles whose video stream itself contains audio.
+      for (int profile = 0; profile < 3; profile++)
+         if (!state.videoHasAudio[profile]) state.videoAvailable[profile] = 0;
+   }
+   state.audioPick = -1;
+   state.audioCount = 0;
+   if (!video->hasAudio) {
+      // Put the uploaded/original AAC rendition first so it cannot be crowded out by
+      // the language-ordered auto-dub formats in YouTube's response.
+      {
+         const StreamFormat *original = pickAudioForTrack(info, "__original_upload__");
+         if (original) {
+            int n = state.audioCount++;
+            strCopy(state.audioIds[n], sizeof state.audioIds[n], "__original_upload__");
+            strCopy(state.audioNames[n], sizeof state.audioNames[n], "Original upload");
+            strCopy(state.audioUrls[n], sizeof state.audioUrls[n], original->url);
+            state.audioItags[n] = original->itag;
+            logInfo("[audio-diag] preserved original AAC itag=%d urlLen=%d\n",
+                    original->itag, (int)strlen(original->url));
+         }
+      }
+      // Add explicitly original/non-dubbed language tracks before auto-dubs, regardless
+      // of YouTube's format ordering. Bitrate/codec variants remain internal.
+      for (int pass = 0; pass < 2 && state.audioCount < MAX_AUDIO_TRACKS; pass++) {
+         for (int i = 0; i < info->formatCount && state.audioCount < MAX_AUDIO_TRACKS; i++) {
+            const StreamFormat *f = &info->formats[i];
+            if (!f->hasAudio || f->hasVideo || !f->audioTrackId[0]) continue;
+            if ((f->audioIsAutoDubbed ? 1 : 0) != pass) continue;
+            int found = 0;
+            for (int j = 0; j < state.audioCount; j++)
+               if (strcmp(state.audioIds[j], f->audioTrackId) == 0) found = 1;
+            if (found) continue;
+            const StreamFormat *best = pickAudioForTrack(info, f->audioTrackId);
+            if (!best) continue;
+            int n = state.audioCount++;
+            strCopy(state.audioIds[n], sizeof state.audioIds[n], best->audioTrackId);
+            if (best->audioIsAutoDubbed)
+               snprintf(state.audioNames[n], sizeof state.audioNames[n], "%s (auto-dubbed)", best->audioTrackName[0] ? best->audioTrackName : best->audioTrackId);
+            else
+               strCopy(state.audioNames[n], sizeof state.audioNames[n], best->audioTrackName[0] ? best->audioTrackName : best->audioTrackId);
+            strCopy(state.audioUrls[n], sizeof state.audioUrls[n], best->url);
+            state.audioItags[n] = best->itag;
+         }
+      }
+      int defaultPick = -1;
+      // Match an explicitly identified non-dubbed original first. Never default to an auto-dub.
+      for (int j = 0; j < state.audioCount; j++) {
+         if (strcmp(state.audioIds[j], "__original_upload__") == 0) { defaultPick = j; break; }
+         const StreamFormat *candidate = pickAudioForTrack(info, state.audioIds[j]);
+         if (candidate && !candidate->audioIsAutoDubbed) { defaultPick = j; break; }
+      }
+      // Match YouTube's declared default only if it is not marked as an auto-dub.
+      if (defaultPick < 0 && info->defaultAudioTrackId[0])
+         for (int j = 0; j < state.audioCount; j++)
+            if (strcmp(state.audioIds[j], info->defaultAudioTrackId) == 0) {
+               const StreamFormat *candidate = pickAudioForTrack(info, state.audioIds[j]);
+               if (candidate && !candidate->audioIsAutoDubbed) defaultPick = j;
+               break;
+            }
+      // Some player responses omit the captions-level ID but mark a default adaptive format.
+      if (defaultPick < 0)
+         for (int i = 0; i < info->formatCount && defaultPick < 0; i++) {
+            const StreamFormat *f = &info->formats[i];
+            if (!f->hasAudio || f->audioIsAutoDubbed || !f->audioIsDefault || !f->audioTrackId[0]) continue;
+            for (int j = 0; j < state.audioCount; j++)
+               if (strcmp(state.audioIds[j], f->audioTrackId) == 0) { defaultPick = j; break; }
+         }
+      logInfo("[audio-diag] video defaultAudioTrackId='%s' defaultPick=%d tracks=%d\n",
+              info->defaultAudioTrackId, defaultPick, state.audioCount);
+      for (int i = 0; i < state.audioCount; i++) {
+         const StreamFormat *trackFormat = pickAudioForTrack(info, state.audioIds[i]);
+         logInfo("[audio-diag] track[%d] id='%s' name='%s' itag=%d default=%d autoDubbed=%d url=%d\n",
+                 i, state.audioIds[i], state.audioNames[i], state.audioItags[i],
+                 trackFormat ? trackFormat->audioIsDefault : 0,
+                 trackFormat ? trackFormat->audioIsAutoDubbed : 0,
+                 state.audioUrls[i][0] != 0);
+      }
+      if (state.audioCount > 0) {
+         state.audioPick = defaultPick;
+         if (defaultPick >= 0) {
+            audio = pickAudioForTrack(info, state.audioIds[defaultPick]);
+            logInfo("[audio-diag] selected default index=%d id='%s' name='%s' itag=%d\n",
+                    defaultPick, state.audioIds[defaultPick], state.audioNames[defaultPick], audio ? audio->itag : 0);
+         } else {
+            audio = NULL;
+            logWarn("[audio-diag] declared default audio track is not available as a selectable stream; starting without an arbitrary dubbed track\n");
+         }
+      } else {
+         logWarn("[audio-diag] no selectable AAC audio tracks parsed\n");
+      }
+   }
    logInfo("[yt] play video itag %d %dx%d %s, audio itag %d\n", video->itag, video->width, video->height,
            video->hasAudio ? "muxed" : "video-only", audio ? audio->itag : (video->hasAudio ? video->itag : 0));
 
    state.vidItag = video->itag; state.vidW = video->width; state.vidH = video->height; state.vidFps = video->fps;
+   state.resolutionIndex = video->height <= 480 ? 0 : (video->height <= 720 ? 1 : 2);
+   // Preserve the exact initial pick in the matching profile slot. It may be a muxed format
+   // selected by the normal selector, while the profile helper found a different adaptive URL.
+   strCopy(state.videoUrls[state.resolutionIndex], sizeof state.videoUrls[state.resolutionIndex], video->url);
+   state.videoItags[state.resolutionIndex] = video->itag;
+   state.videoWidths[state.resolutionIndex] = video->width;
+   state.videoHeights[state.resolutionIndex] = video->height;
+   state.videoFps[state.resolutionIndex] = video->fps;
+   state.videoHasAudio[state.resolutionIndex] = video->hasAudio;
+   state.videoAvailable[state.resolutionIndex] = 1;
    state.audItag = audio ? audio->itag : (video->hasAudio ? video->itag : 0);
+   if (state.audioPick >= 0 && state.audioPick < state.audioCount) snprintf(state.message, sizeof state.message, "Loading audio: %s", state.audioNames[state.audioPick]);
    state.isLive = video->isLiveSegmented;
 
-   // open the decoder: both streams ride the http module by range request. an audio open
-   // failure inside the player just means silent playback. NULL if it can't be demuxed/decoded.
+   // Open both streams. A failed separate audio open still permits silent video playback.
    state.pendingPlayer = createVideoPlayerSplit(video->url, audio ? audio->url : NULL, allocGfxVideoBuffer, freeGfxVideoBuffer);
    if (!state.pendingPlayer) { fail("couldn't open stream"); goto done; }
 
@@ -343,6 +509,207 @@ static void cycleSubtitles(void)
    showControls();
 }
 
+static void audioSwitchWorker(uint64_t arg)
+{
+   (void)arg;
+   int target = state.audioSwitchTarget;
+   logInfo("[audio-diag] L3 switch begin old=%d target=%d id='%s' posMs=%d wasPaused=%d urlLen=%d\n",
+           state.audioPick, target, state.audioIds[target],
+           (int)(state.audioSwitchPosition * 1000.0f), state.audioSwitchWasPaused,
+           (int)strlen(state.audioUrls[target]));
+   int rc = replaceVideoPlayerAudio(state.player, state.audioUrls[target], state.audioSwitchPosition);
+   state.audioSwitchFallback = rc == 0;
+   if (rc == 0)
+      logInfo("[audio-diag] L3 switch accepted target=%d itag=%d\n", target, state.audioItags[target]);
+   else
+      logWarn("[audio-diag] L3 switch failed target=%d; previous video remains active\n", target);
+   __sync_synchronize();
+   state.audioSwitchDone = 1;
+   exitThread();
+}
+
+static VideoPlayer *openReadyResolutionPlayer(const char *videoUrl, const char *audioUrl, float position)
+{
+   VideoPlayer *replacement = createVideoPlayerSplit(videoUrl, audioUrl && audioUrl[0] ? audioUrl : NULL,
+                                                     allocGfxVideoBuffer, freeGfxVideoBuffer);
+   if (!replacement) return NULL;
+   if (audioUrl && audioUrl[0] && !isVideoPlayerUsingSeparateAudio(replacement)) {
+      logWarn("[video-diag] replacement video did not open the requested separate audio source\n");
+      destroyVideoPlayer(replacement);
+      return NULL;
+   }
+   if (position > 0.5f) seekVideoPlayer(replacement, position);
+   setVideoPaused(replacement, 1);
+
+   // Only one VDEC instance is kept alive during a resolution change. The previous player is
+   // retired before this function is called, avoiding a second decoder's SPU/work-memory demand.
+   uint64_t started = sys_time_get_system_time();
+   while (!isVideoPlayerReady(replacement) &&
+          sys_time_get_system_time() - started < 15000000ull) sleepMs(50);
+   if (!isVideoPlayerReady(replacement)) {
+      logWarn("[video-diag] resolution stream did not reach decoded pre-roll\n");
+      destroyVideoPlayer(replacement);
+      return NULL;
+   }
+   return replacement;
+}
+
+static void resolutionSwitchWorker(uint64_t arg)
+{
+   (void)arg;
+   VideoPlayer *oldPlayer = state.retiringResolutionPlayer;
+   state.retiringResolutionPlayer = NULL;
+   if (oldPlayer) destroyVideoPlayer(oldPlayer);
+
+   VideoPlayer *replacement = NULL;
+   if (!state.resolutionSwitchAborting)
+      replacement = openReadyResolutionPlayer(state.resolutionSwitchVideoUrl,
+                                               state.resolutionSwitchAudioUrl,
+                                               state.resolutionSwitchPosition);
+
+   // If the requested rendition cannot be opened, recover the previous rendition before
+   // reporting completion. This avoids leaving playback blank after a failed manual switch.
+   if (!replacement && !state.resolutionSwitchAborting) {
+      logWarn("[video-diag] requested resolution failed; reopening previous rendition\n");
+      replacement = openReadyResolutionPlayer(state.resolutionSwitchOldVideoUrl,
+                                                state.resolutionSwitchOldAudioUrl,
+                                                state.resolutionSwitchPosition);
+      state.resolutionSwitchRestored = replacement != NULL;
+   }
+
+   if (!replacement && !state.resolutionSwitchAborting) {
+      strCopy(state.message, sizeof state.message, "Resolution switch and recovery failed");
+      state.stage = STAGE_FAILED;
+   }
+   state.pendingResolutionPlayer = replacement;
+   __sync_synchronize();
+   state.resolutionSwitchDone = 1;
+   exitThread();
+}
+
+static int startResolutionSwitch(int target, int automaticFallback)
+{
+   if (target < 0 || target >= 3 || !state.videoAvailable[target] ||
+       !state.player || state.resolutionSwitchThreadActive || state.audioSwitchThreadActive ||
+       state.seeking || state.isLive) return 0;
+   if (strcmp(state.videoUrls[target], state.videoUrls[state.resolutionIndex]) == 0) return 0;
+
+   state.resolutionSwitchTarget = target;
+   state.resolutionSwitchOldIndex = state.resolutionIndex;
+   state.resolutionSwitchRestored = 0;
+   state.resolutionSwitchAborting = 0;
+   state.resolutionSwitchWasPaused = isVideoPaused(state.player);
+   state.resolutionSwitchWasFirstFrameSeen = state.firstFrameSeen;
+   state.resolutionSwitchPosition = getVideoPositionSeconds(state.player);
+   strCopy(state.resolutionSwitchVideoUrl, sizeof state.resolutionSwitchVideoUrl, state.videoUrls[target]);
+   strCopy(state.resolutionSwitchOldVideoUrl, sizeof state.resolutionSwitchOldVideoUrl,
+           state.videoUrls[state.resolutionIndex]);
+   state.resolutionSwitchAudioUrl[0] = 0;
+   state.resolutionSwitchOldAudioUrl[0] = 0;
+   if (state.audioPick >= 0 && state.audioPick < state.audioCount)
+      strCopy(state.resolutionSwitchAudioUrl, sizeof state.resolutionSwitchAudioUrl, state.audioUrls[state.audioPick]);
+   else if (state.fallbackAudioUrl[0])
+      strCopy(state.resolutionSwitchAudioUrl, sizeof state.resolutionSwitchAudioUrl, state.fallbackAudioUrl);
+   if (state.audioPick >= 0 && state.audioPick < state.audioCount)
+      strCopy(state.resolutionSwitchOldAudioUrl, sizeof state.resolutionSwitchOldAudioUrl, state.audioUrls[state.audioPick]);
+   else if (state.fallbackAudioUrl[0] && isVideoPlayerUsingSeparateAudio(state.player))
+      strCopy(state.resolutionSwitchOldAudioUrl, sizeof state.resolutionSwitchOldAudioUrl, state.fallbackAudioUrl);
+
+   setVideoPaused(state.player, 1);
+   if (state.firstFrameSeen && !state.isLive)
+      setWatchedPosition(requestedInput, (int)state.resolutionSwitchPosition);
+   finishGfx();   // retire the displayed frame before the worker frees its RSX-visible buffers
+   state.retiringResolutionPlayer = state.player;
+   state.player = NULL;
+   state.firstFrameSeen = 0;
+   state.resolutionSwitchDone = 0;
+   state.resolutionSwitchThreadActive = (spawnJoinableThread(&state.resolutionSwitchTid, resolutionSwitchWorker, 0,
+                                         THREAD_PRIORITY_DEFAULT, THREAD_STACK_SIZE_64KB, "yt-resolution") == 0);
+   if (!state.resolutionSwitchThreadActive) {
+      state.player = state.retiringResolutionPlayer;
+      state.retiringResolutionPlayer = NULL;
+      if (!state.resolutionSwitchWasPaused && state.player) setVideoPaused(state.player, 0);
+      state.firstFrameSeen = state.resolutionSwitchWasFirstFrameSeen;
+      showToast("Resolution switch could not start");
+      return 0;
+   }
+   {
+      char notice[96];
+      if (state.videoFps[target] > 0) {
+         if (automaticFallback)
+            snprintf(notice, sizeof notice, "Audio issue; reducing to %dp @ %d FPS",
+                     state.videoHeights[target], state.videoFps[target]);
+         else
+            snprintf(notice, sizeof notice, "Changing to %dp @ %d FPS",
+                     state.videoHeights[target], state.videoFps[target]);
+      } else {
+         if (automaticFallback)
+            snprintf(notice, sizeof notice, "Audio issue; reducing to %dp", state.videoHeights[target]);
+         else
+            snprintf(notice, sizeof notice, "Changing to %dp", state.videoHeights[target]);
+      }
+      showToast(notice);
+   }
+   return 1;
+}
+
+static int findLowerResolutionProfile(void)
+{
+   for (int profile = state.resolutionIndex - 1; profile >= 0; profile--) {
+      if (!state.videoAvailable[profile]) continue;
+      if (strcmp(state.videoUrls[profile], state.videoUrls[state.resolutionIndex]) == 0) continue;
+      return profile;
+   }
+   return -1;
+}
+
+static void cycleResolution(void)
+{
+   if (state.resolutionSwitchThreadActive || state.audioSwitchThreadActive || state.seeking) {
+      showToast("Wait for the current operation");
+      return;
+   }
+   for (int step = 1; step <= 3; step++) {
+      int target = (state.resolutionIndex + step) % 3;
+      if (target != state.resolutionIndex && state.videoAvailable[target] &&
+          strcmp(state.videoUrls[target], state.videoUrls[state.resolutionIndex]) != 0) {
+         state.audioFallbackAttempted = 0;
+         startResolutionSwitch(target, 0);
+         return;
+      }
+   }
+   showToast("No other resolution available");
+}
+
+static void cycleAudioTrack(void)
+{
+   if (state.seeking) {
+      logWarn("[audio-diag] L3 ignored while a seek transaction is pending\n");
+      showToast("Wait for seek to finish before switching audio");
+      return;
+   }
+   if (state.audioCount < 2 || state.isLive || !state.player || state.audioSwitchThreadActive) {
+      showToast(state.audioCount < 2 ? "No alternate audio tracks" : "Audio track busy/unavailable");
+      return;
+   }
+   state.audioSwitchPosition = getVideoPositionSeconds(state.player);
+   state.audioSwitchWasPaused = isVideoPaused(state.player);
+   state.audioSwitchTarget = (state.audioPick + 1) % state.audioCount;
+   state.audioFallbackAttempted = 0;
+   state.audioSwitchFallback = 0;
+   setVideoPaused(state.player, 1);
+   snprintf(state.message, sizeof state.message, "Loading audio: %s", state.audioNames[state.audioSwitchTarget]);
+   { char notice[96]; snprintf(notice, sizeof notice, "Loading audio: %s", state.audioNames[state.audioSwitchTarget]); showToast(notice); }
+   state.audioSwitchDone = 0;
+   state.audioSwitchThreadActive = (spawnJoinableThread(&state.audioSwitchTid, audioSwitchWorker, 0,
+                                    THREAD_PRIORITY_DEFAULT, THREAD_STACK_SIZE_64KB, "yt-audio") == 0);
+   if (!state.audioSwitchThreadActive) {
+      state.message[0] = 0;
+      if (!state.audioSwitchWasPaused) setVideoPaused(state.player, 0);
+      showToast("Audio switch failed");
+   }
+}
+
 // accumulates a scrub target while left/right is held; the engine seek fires once input goes quiet
 static void nudgeSeek(float deltaSeconds, uint64_t nowUs)
 {
@@ -358,12 +725,16 @@ static void nudgeSeek(float deltaSeconds, uint64_t nowUs)
 // left/right scrub, cross toggles pause (restarts if the video ended). only once playing.
 static void handlePlaybackInput(void)
 {
+   if (state.audioSwitchThreadActive || state.resolutionSwitchThreadActive)
+      return; // keep the source stable until the staged handoff commits
    uint64_t nowUs = sys_time_get_system_time();
 
    if (isPadButtonPressed(PAD_BTN_R2)) {
       cropToFillEnabled = !cropToFillEnabled;
       showToast(cropToFillEnabled ? "Crop to fill: ON" : "Crop to fill: OFF");
    }
+
+   if (isPadButtonPressed(PAD_BTN_SQUARE)) cycleResolution();
 
    if (isPadButtonPressed(PAD_BTN_CROSS)) {
       if (isVideoEnded(state.player)) seekVideoPlayer(state.player, 0.0f);
@@ -372,11 +743,12 @@ static void handlePlaybackInput(void)
    }
 
    if (isPadButtonPressed(PAD_BTN_TRIANGLE)) cycleSubtitles();
+   if (isPadButtonPressed(PAD_BTN_L3)) cycleAudioTrack();
 
    // volume: the widget steps itself on up/down; apply + persist the new level (works on live streams too)
    if (handleVolumeMeterInput(&volumeMeter)) {
       volumeLevel = volumeMeter.level;
-      setAudioPcmFeedVolume(getVolumeMeterFraction(&volumeMeter));
+      setVideoPlayerAudioVolume(state.player, getVolumeMeterFraction(&volumeMeter));
    }
 
    if (state.isLive) return;   // a live stream has no seek index; scrubbing would break the segment stream
@@ -538,10 +910,92 @@ static void updatePlay(void)
       if (state.pendingPlayer) {
          state.player = state.pendingPlayer;
          state.pendingPlayer = NULL;
-         setAudioPcmFeedVolume(getVolumeMeterFraction(&volumeMeter));
+         state.message[0] = 0;
+         setVideoPlayerAudioVolume(state.player, getVolumeMeterFraction(&volumeMeter));
          if (state.pauseWhenReady) setVideoPaused(state.player, 1);
          setLabelText(&titleLabel, state.title);   // rasterise once, off the draw path
          state.stage = STAGE_PLAYING;
+         if (state.audioPick >= 0 && state.audioPick < state.audioCount) { char notice[96]; snprintf(notice, sizeof notice, "Audio: %s", state.audioNames[state.audioPick]); showToast(notice); }
+         else if (state.audioCount > 0) showToast("Default audio track unavailable; use L3 to choose a track");
+      }
+   }
+
+   // Complete the audio-only handoff. The same VideoPlayer and H.264 decoder remain in place.
+   if (state.audioSwitchDone && state.audioSwitchThreadActive) {
+      joinThread(state.audioSwitchTid);
+      state.audioSwitchThreadActive = 0;
+      state.message[0] = 0;
+      if (state.audioSwitchFallback) {
+         state.audioPick = state.audioSwitchTarget;
+         state.audItag = state.audioItags[state.audioPick];
+         setVideoPlayerAudioVolume(state.player, getVolumeMeterFraction(&volumeMeter));
+         { char notice[96]; snprintf(notice, sizeof notice, "Audio: %s", state.audioNames[state.audioPick]); showToast(notice); }
+      } else {
+         showToast("Audio switch failed; video continues");
+      }
+      if (!state.audioSwitchWasPaused && state.player) setVideoPaused(state.player, 0);
+      if (!state.audioSwitchFallback && !state.audioFallbackAttempted) {
+         state.audioFallbackAttempted = 1;
+         int lowerProfile = findLowerResolutionProfile();
+         if (lowerProfile >= 0) startResolutionSwitch(lowerProfile, 1);
+      }
+   }
+
+   // Commit a resolution change only after its replacement player has reached a decoded pre-roll.
+   if (state.resolutionSwitchDone && state.resolutionSwitchThreadActive) {
+      joinThread(state.resolutionSwitchTid);
+      state.resolutionSwitchThreadActive = 0;
+      if (state.pendingResolutionPlayer) {
+         state.player = state.pendingResolutionPlayer;
+         state.pendingResolutionPlayer = NULL;
+         if (state.resolutionSwitchRestored) {
+            state.resolutionIndex = state.resolutionSwitchOldIndex;
+         } else {
+            state.resolutionIndex = state.resolutionSwitchTarget;
+            state.vidItag = state.videoItags[state.resolutionIndex];
+            state.vidW = state.videoWidths[state.resolutionIndex];
+            state.vidH = state.videoHeights[state.resolutionIndex];
+            state.vidFps = state.videoFps[state.resolutionIndex];
+            if (state.resolutionIndex == 2) state.audioFallbackAttempted = 0;
+            if (state.audioPick >= 0 && state.audioPick < state.audioCount)
+               state.audItag = state.audioItags[state.audioPick];
+            else if (state.fallbackAudioItag)
+               state.audItag = state.fallbackAudioItag;
+         }
+         setVideoPlayerAudioVolume(state.player, getVolumeMeterFraction(&volumeMeter));
+         if (!state.resolutionSwitchWasPaused) setVideoPaused(state.player, 0);
+         state.firstFrameSeen = 0;
+         state.lastFrame = NULL;
+         state.framesThisSecond = state.measuredFps = 0;
+         state.message[0] = 0;
+         if (state.resolutionSwitchRestored) {
+            showToast("Resolution unavailable; previous stream restored");
+         } else {
+            char notice[64];
+            if (state.vidFps > 0)
+               snprintf(notice, sizeof notice, "Video: %dp @ %d FPS", state.vidH, state.vidFps);
+            else
+               snprintf(notice, sizeof notice, "Video: %dp", state.vidH);
+            showToast(notice);
+         }
+      } else {
+         showToast("Resolution switch and recovery failed");
+      }
+   }
+
+   // A track can pass the initial AAC probe and then die during playback. Retry the current
+   // audio track on the highest available lower video profile once; never loop retries.
+   if (state.stage == STAGE_PLAYING && state.player &&
+       (state.audioPick >= 0 || state.fallbackAudioUrl[0]) && !state.isLive &&
+       !state.audioFallbackAttempted &&
+       isVideoPlayerUsingSeparateAudio(state.player) &&
+       !isVideoPlayerSeparateAudioAlive(state.player) && !isVideoEnded(state.player)) {
+      float duration = getVideoDurationSeconds(state.player);
+      float position = getVideoPositionSeconds(state.player);
+      if (duration <= 0.0f || position < duration - 5.0f) {
+         state.audioFallbackAttempted = 1;
+         int lowerProfile = findLowerResolutionProfile();
+         if (lowerProfile >= 0) startResolutionSwitch(lowerProfile, 1);
       }
    }
 
@@ -598,8 +1052,10 @@ static void updatePlay(void)
 
    // status text: the failure reason, or "Loading..." until playback. setLabelText skips unchanged
    // text, so calling it each frame only rasterises on a real change.
-   if (state.stage == STAGE_FAILED) setLabelText(&statusLabel, state.message);
-   else if (state.stage != STAGE_PLAYING) setLabelText(&statusLabel, "Loading...");
+   if (state.audioSwitchThreadActive) setLabelText(&statusLabel, state.message[0] ? state.message : "Loading audio...");
+   else if (state.resolutionSwitchThreadActive) setLabelText(&statusLabel, "Changing resolution...");
+   else if (state.stage == STAGE_FAILED) setLabelText(&statusLabel, state.message);
+   else if (state.stage != STAGE_PLAYING) setLabelText(&statusLabel, state.message[0] ? state.message : "Loading...");
 }
 
 // measure the real presented frame rate: a changed frame pointer is a new frame; tally them per second.
@@ -832,7 +1288,7 @@ static void drawPlay(void)
 
    // until the first frame is presented (open, then the async resume seek's reload) keep the loading
    // status up instead of a black screen; with no player this shows the failure message.
-   if (!state.firstFrameSeen)
+   if (!state.firstFrameSeen || state.audioSwitchThreadActive || state.resolutionSwitchThreadActive)
       drawLabelAt(&statusLabel, state.screenW / 2 - statusLabel.tt.tex.w / 2, state.screenH / 2 - 14);
 
    // Restore the selected library scale before the next screen is drawn.
@@ -844,9 +1300,12 @@ static void termPlay(void)
    // Wake worker threads blocked in TLS connect/read before joining them. Without this, leaving during
    // a slow YouTube resolve can make the screen manager wait through several 10-second socket timeouts.
    setHttpRequestsCancelled(1);
+   state.resolutionSwitchAborting = 1;
    if (state.threadActive) { joinThread(state.workerTid); state.threadActive = 0; }
    if (state.sbThreadActive) { joinThread(state.sbWorkerTid); state.sbThreadActive = 0; }   // usually already done
    if (state.subThreadActive) { joinThread(state.subWorkerTid); state.subThreadActive = 0; }
+   if (state.audioSwitchThreadActive) { joinThread(state.audioSwitchTid); state.audioSwitchThreadActive = 0; }
+   if (state.resolutionSwitchThreadActive) { joinThread(state.resolutionSwitchTid); state.resolutionSwitchThreadActive = 0; }
    if (state.chThreadActive) { joinThread(state.chWorkerTid); state.chThreadActive = 0; }
    free(state.subtitleTrack);
    state.subtitleTrack = NULL;
@@ -855,9 +1314,12 @@ static void termPlay(void)
    // clobber a good saved position with 0. storage ignores non-id keys, so typed urls no-op.
    if (state.player && state.firstFrameSeen && !state.isLive)
       setWatchedPosition(requestedInput, isVideoEnded(state.player) ? 0 : (int)getVideoPositionSeconds(state.player));
-   if (state.player || state.pendingPlayer) finishGfx();   // RSX may still be sampling a frame buffer
+   if (state.player || state.pendingPlayer || state.pendingResolutionPlayer || state.retiringResolutionPlayer)
+      finishGfx();   // RSX may still be sampling a frame buffer
    if (state.player) { destroyVideoPlayer(state.player); state.player = NULL; }
    if (state.pendingPlayer) { destroyVideoPlayer(state.pendingPlayer); state.pendingPlayer = NULL; }
+   if (state.pendingResolutionPlayer) { destroyVideoPlayer(state.pendingResolutionPlayer); state.pendingResolutionPlayer = NULL; }
+   if (state.retiringResolutionPlayer) { destroyVideoPlayer(state.retiringResolutionPlayer); state.retiringResolutionPlayer = NULL; }
    freeLabel(&statusLabel);
    for (int i = 0; i < STAT_LINES; i++) freeLabel(&statLabels[i]);
    freeLabel(&timeLeftLabel);

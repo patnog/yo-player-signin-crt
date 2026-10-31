@@ -78,7 +78,7 @@ static Audio * volatile mixingStream = NULL;
 
 // external PCM feed (video playback): lock-free single-producer ring drained by the mixer
 #define FEED_RING_FRAMES  32768   // stereo frames, power of two (~0.68 s at 48 kHz)
-static struct {
+typedef struct {
    float   *ring;                 // interleaved stereo
    volatile uint32_t head, tail;  // free-running frame counters (producer / mixer)
    volatile uint64_t consumed;    // total source frames mixed out — the video player's A/V clock
@@ -89,7 +89,9 @@ static struct {
    volatile int active, paused;
    volatile int priming;          // hold consumption until a backlog exists (start / post-flush)
    volatile int mixerInFeed;      // handshake so closeAudioPcmFeed never frees the ring mid-block
-} feed;
+} PcmFeed;
+#define PCM_FEED_COUNT 2
+static PcmFeed feeds[PCM_FEED_COUNT];
 
 // ============================================================================
 // ogg decode (full memory)
@@ -271,39 +273,36 @@ static void mixStreamBlock(Audio *a, float *mix, double step, float vol) {
 // mixes one block from the external PCM feed, resampling with linear interpolation. Underrun just
 // leaves silence for the rest of the block; the clock only advances by frames actually consumed.
 static void mixFeedBlock(float *mix) {
-   feed.mixerInFeed = 1;
-   __sync_synchronize();
-   if (!feed.active || feed.paused || !feed.ring) { feed.mixerInFeed = 0; return; }
-
-   // hold consumption until the producer has built a backlog: draining from the very first pushed
-   // frame underruns in bursts at startup, and each underrun freezes the A/V clock (video stutter)
-   if (feed.priming) {
-      if (feed.head - feed.tail < (uint32_t)feed.primeFrames) { feed.mixerInFeed = 0; return; }
-      feed.priming = 0;
+   for (int n = 0; n < PCM_FEED_COUNT; n++) {
+      PcmFeed *feed = &feeds[n];
+      feed->mixerInFeed = 1;
+      __sync_synchronize();
+      if (!feed->active || feed->paused || !feed->ring) { feed->mixerInFeed = 0; continue; }
+      if (feed->priming) {
+         if (feed->head - feed->tail < (uint32_t)feed->primeFrames) { feed->mixerInFeed = 0; continue; }
+         feed->priming = 0;
+      }
+      double step = (double)feed->sampleRate / (double)AUDIO_SAMPLE_RATE;
+      float vol = feed->volume * masterVolume;
+      uint32_t available = feed->head - feed->tail;
+      double pos = feed->readPos;
+      for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
+         uint32_t base = (uint32_t)pos;
+         if (base + 1 >= available) break;
+         float fraction = (float)(pos - base);
+         uint32_t i0 = ((feed->tail + base) & (FEED_RING_FRAMES - 1)) * 2;
+         uint32_t i1 = ((feed->tail + base + 1) & (FEED_RING_FRAMES - 1)) * 2;
+         mix[i * 2] += vol * (feed->ring[i0] + fraction * (feed->ring[i1] - feed->ring[i0]));
+         mix[i * 2 + 1] += vol * (feed->ring[i0 + 1] + fraction * (feed->ring[i1 + 1] - feed->ring[i0 + 1]));
+         pos += step;
+      }
+      uint32_t consumedFrames = (uint32_t)pos;
+      feed->readPos = pos - consumedFrames;
+      feed->tail += consumedFrames;
+      feed->consumed += consumedFrames;
+      __sync_synchronize();
+      feed->mixerInFeed = 0;
    }
-
-   double step = (double)feed.sampleRate / (double)AUDIO_SAMPLE_RATE;
-   float vol = feed.volume * masterVolume;
-   uint32_t available = feed.head - feed.tail;
-
-   double pos = feed.readPos;
-   for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
-      uint32_t base = (uint32_t)pos;
-      if (base + 1 >= available) break;   // underrun: need a frame pair to interpolate
-      float fraction = (float)(pos - base);
-      uint32_t i0 = ((feed.tail + base)     & (FEED_RING_FRAMES - 1)) * 2;
-      uint32_t i1 = ((feed.tail + base + 1) & (FEED_RING_FRAMES - 1)) * 2;
-      mix[i * 2]     += vol * (feed.ring[i0]     + fraction * (feed.ring[i1]     - feed.ring[i0]));
-      mix[i * 2 + 1] += vol * (feed.ring[i0 + 1] + fraction * (feed.ring[i1 + 1] - feed.ring[i0 + 1]));
-      pos += step;
-   }
-
-   uint32_t consumedFrames = (uint32_t)pos;
-   feed.readPos = pos - consumedFrames;
-   feed.tail += consumedFrames;
-   feed.consumed += consumedFrames;
-   __sync_synchronize();
-   feed.mixerInFeed = 0;
 }
 
 static void audioMixerThread(uint64_t arg) {
@@ -892,76 +891,61 @@ void lowerAudioMasterVolume(float amount) {
 // external PCM feed (video playback)
 // ============================================================================
 
-int openAudioPcmFeed(int sampleRate, int primeFrames) {
-   if (feed.active || sampleRate <= 0) return -1;
+int openAudioPcmFeedSlot(int sampleRate, int primeFrames) {
+   if (sampleRate <= 0) return -1;
+   int slot = -1;
+   for (int i = 0; i < PCM_FEED_COUNT; i++) if (!feeds[i].active && !feeds[i].ring) { slot = i; break; }
+   if (slot < 0) return -1;
+   PcmFeed *feed = &feeds[slot];
    if (primeFrames <= 0 || primeFrames > FEED_RING_FRAMES / 2) primeFrames = FEED_RING_FRAMES / 2;
-   feed.ring = (float *)calloc(FEED_RING_FRAMES * 2, sizeof(float));
-   if (!feed.ring) return -1;
-   feed.head = feed.tail = 0;
-   feed.consumed = 0;
-   feed.readPos = 0.0;
-   feed.sampleRate = sampleRate;
-   feed.primeFrames = primeFrames;
-   feed.volume = 1.0f;
-   feed.paused = 0;
-   feed.priming = 1;
-   __sync_synchronize();
-   feed.active = 1;
-   return 0;
+   feed->ring = (float *)calloc(FEED_RING_FRAMES * 2, sizeof(float));
+   if (!feed->ring) return -1;
+   feed->head = feed->tail = 0; feed->consumed = 0; feed->readPos = 0.0;
+   feed->sampleRate = sampleRate; feed->primeFrames = primeFrames; feed->volume = 1.0f;
+   feed->paused = 0; feed->priming = 1; __sync_synchronize(); feed->active = 1;
+   return slot;
 }
-
-void closeAudioPcmFeed(void) {
-   if (!feed.active) return;
-   feed.active = 0;
-   __sync_synchronize();
-   while (feed.mixerInFeed) sys_timer_usleep(200);   // let a mixer block in flight leave the ring
-   free(feed.ring);
-   feed.ring = NULL;
+int openAudioPcmFeed(int sampleRate, int primeFrames) {
+   if (sampleRate <= 0 || feeds[0].active || feeds[0].ring) return -1;
+   PcmFeed *feed = &feeds[0];
+   if (primeFrames <= 0 || primeFrames > FEED_RING_FRAMES / 2) primeFrames = FEED_RING_FRAMES / 2;
+   feed->ring = (float *)calloc(FEED_RING_FRAMES * 2, sizeof(float)); if (!feed->ring) return -1;
+   feed->head = feed->tail = 0; feed->consumed = 0; feed->readPos = 0.0; feed->sampleRate = sampleRate;
+   feed->primeFrames = primeFrames; feed->volume = 1.0f; feed->paused = 0; feed->priming = 1;
+   __sync_synchronize(); feed->active = 1; return 0;
 }
-
-int pushAudioPcm(const float *stereoFrames, int frameCount) {
-   if (!feed.active || frameCount <= 0) return 0;
-   uint32_t space = FEED_RING_FRAMES - (feed.head - feed.tail);
+void closeAudioPcmFeedSlot(int slot) {
+   if (slot < 0 || slot >= PCM_FEED_COUNT) return;
+   PcmFeed *feed = &feeds[slot]; if (!feed->active) return;
+   feed->active = 0; __sync_synchronize();
+   while (feed->mixerInFeed) sys_timer_usleep(200);
+   free(feed->ring); feed->ring = NULL;
+}
+void closeAudioPcmFeed(void) { closeAudioPcmFeedSlot(0); }
+int pushAudioPcmSlot(int slot, const float *stereoFrames, int frameCount) {
+   if (slot < 0 || slot >= PCM_FEED_COUNT) return 0;
+   PcmFeed *feed = &feeds[slot]; if (!feed->active || frameCount <= 0) return 0;
+   uint32_t space = FEED_RING_FRAMES - (feed->head - feed->tail);
    if ((uint32_t)frameCount > space) frameCount = (int)space;
-   for (int i = 0; i < frameCount; i++) {
-      uint32_t slot = ((feed.head + i) & (FEED_RING_FRAMES - 1)) * 2;
-      feed.ring[slot]     = stereoFrames[i * 2];
-      feed.ring[slot + 1] = stereoFrames[i * 2 + 1];
-   }
-   __sync_synchronize();   // frames must be visible before the head moves
-   feed.head += frameCount;
-   return frameCount;
+   for (int i = 0; i < frameCount; i++) { uint32_t at = ((feed->head + i) & (FEED_RING_FRAMES - 1)) * 2; feed->ring[at] = stereoFrames[i * 2]; feed->ring[at + 1] = stereoFrames[i * 2 + 1]; }
+   __sync_synchronize(); feed->head += frameCount; return frameCount;
+}
+int pushAudioPcm(const float *stereoFrames, int frameCount) { return pushAudioPcmSlot(0, stereoFrames, frameCount); }
+int getAudioPcmFeedSpaceSlot(int slot) { if (slot < 0 || slot >= PCM_FEED_COUNT || !feeds[slot].active) return 0; return (int)(FEED_RING_FRAMES - (feeds[slot].head - feeds[slot].tail)); }
+int getAudioPcmFeedSpace(void) { return getAudioPcmFeedSpaceSlot(0); }
+uint64_t getAudioPcmFeedPlayedFramesSlot(int slot) { return slot < 0 || slot >= PCM_FEED_COUNT ? 0 : feeds[slot].consumed; }
+uint64_t getAudioPcmFeedPlayedFrames(void) { return getAudioPcmFeedPlayedFramesSlot(0); }
+void setAudioPcmFeedVolumeSlot(int slot, float volume) { if (slot < 0 || slot >= PCM_FEED_COUNT) return; if (volume < 0) volume = 0; if (volume > 1) volume = 1; feeds[slot].volume = volume; }
+void setAudioPcmFeedVolume(float volume) { setAudioPcmFeedVolumeSlot(0, volume); }
+void pauseAudioPcmFeedSlot(int slot, int paused) { if (slot >= 0 && slot < PCM_FEED_COUNT) feeds[slot].paused = paused; }
+void pauseAudioPcmFeed(int paused) { pauseAudioPcmFeedSlot(0, paused); }
+void flushAudioPcmFeedSlot(int slot) {
+   if (slot < 0 || slot >= PCM_FEED_COUNT) return; PcmFeed *feed = &feeds[slot]; if (!feed->active) return;
+   int wasPaused = feed->paused; feed->paused = 1; __sync_synchronize();
+   while (feed->mixerInFeed) sys_timer_usleep(200);
+   feed->tail = feed->head; feed->readPos = 0.0; feed->consumed = 0; feed->priming = 1;
+   __sync_synchronize(); feed->paused = wasPaused;
 }
 
-int getAudioPcmFeedSpace(void) {
-   if (!feed.active) return 0;
-   return (int)(FEED_RING_FRAMES - (feed.head - feed.tail));
-}
+void flushAudioPcmFeed(void) { flushAudioPcmFeedSlot(0); }
 
-uint64_t getAudioPcmFeedPlayedFrames(void) {
-   return feed.consumed;
-}
-
-void setAudioPcmFeedVolume(float volume) {
-   if (volume < 0.0f) volume = 0.0f;
-   if (volume > 1.0f) volume = 1.0f;
-   feed.volume = volume;
-}
-
-void pauseAudioPcmFeed(int paused) {
-   feed.paused = paused;
-}
-
-void flushAudioPcmFeed(void) {
-   if (!feed.active) return;
-   int wasPaused = feed.paused;
-   feed.paused = 1;
-   __sync_synchronize();
-   while (feed.mixerInFeed) sys_timer_usleep(200);   // let a mixer block in flight leave the ring
-   feed.tail = feed.head;
-   feed.readPos = 0.0;
-   feed.consumed = 0;   // the A/V clock re-anchors at the first frame pushed after the flush
-   feed.priming = 1;    // rebuild the backlog before draining resumes (same as at open)
-   __sync_synchronize();
-   feed.paused = wasPaused;
-}

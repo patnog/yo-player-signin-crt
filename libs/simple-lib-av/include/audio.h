@@ -132,6 +132,14 @@ void  lowerAudioMasterVolume(float amount);
 // primeFrames is the backlog the mixer builds before it starts playing: it absorbs late-arriving
 // audio, and it is also pure added delay. file playback wants a big one (~0.35s, the default when
 // 0 is passed); live streaming wants a small one, because there the delay is the whole point.
+int      openAudioPcmFeedSlot(int sampleRate, int primeFrames);
+void     closeAudioPcmFeedSlot(int slot);
+int      pushAudioPcmSlot(int slot, const float *stereoFrames, int frameCount);
+int      getAudioPcmFeedSpaceSlot(int slot);
+uint64_t getAudioPcmFeedPlayedFramesSlot(int slot);
+void     setAudioPcmFeedVolumeSlot(int slot, float volume);
+void     pauseAudioPcmFeedSlot(int slot, int paused);
+void     flushAudioPcmFeedSlot(int slot);
 int      openAudioPcmFeed(int sampleRate, int primeFrames);         // 0 ok, -1 if busy/OOM
 void     closeAudioPcmFeed(void);
 int      pushAudioPcm(const float *stereoFrames, int frameCount);   // frames accepted (< frameCount when the ring is full)

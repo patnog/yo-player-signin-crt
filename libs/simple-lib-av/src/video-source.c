@@ -121,7 +121,9 @@ uint64_t getVideoSourceSize(const VideoSource *source) { return source->size; }
 
 void cancelVideoSource(VideoSource *source)
 {
-   if (source->isOpen && source->isLive) cancelLiveSource(source->live);
+   if (!source->isOpen) return;
+   if (source->isLive) cancelLiveSource(source->live);
+   else if (source->isHttp) cancelHttpStream(source->http);
 }
 
 void closeVideoSource(VideoSource *source)

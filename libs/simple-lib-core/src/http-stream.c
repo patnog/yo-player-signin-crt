@@ -18,6 +18,7 @@
 
 #define HTTP_URL_MAX 2048
 #define MAX_STREAMS  4
+#define READER_STARVE_LIMIT_MS 12000
 
 // the ring keeps a window of streamed bytes indexed by file offset % RING_SIZE. the prefetch thread fills
 // it forward to PREFETCH_AHEAD past the read position; the rest is history for small back-reads. A read
@@ -47,6 +48,7 @@
 
 struct HttpStream {
    int              inUse;
+   volatile int     readerCancelled;
    char             url[HTTP_URL_MAX];
    uint8_t         *ring;
    uint64_t         position;      // reader's logical read position (guarded by stateLock)
@@ -336,11 +338,18 @@ HttpStream *openHttpStream(const char *url)
    HttpStream *stream = NULL;
    for (int i = 0; i < MAX_STREAMS; i++)
       if (!streams[i].inUse) { stream = &streams[i]; break; }
-   if (!stream) { unlock(&streamsLock); free(ring); return NULL; }
+   if (!stream) {
+      logError("[http] stream limit reached (%d active maximum)\n", MAX_STREAMS);
+      unlock(&streamsLock); free(ring); return NULL;
+   }
    memset(stream, 0, sizeof *stream);
    stream->inUse = 1;
    stream->slot = (int)(stream - streams);
+   int active = 0;
+   for (int i = 0; i < MAX_STREAMS; i++) if (streams[i].inUse) active++;
    unlock(&streamsLock);
+
+   logInfo("[http] s%d allocated; active streams=%d/%d\n", stream->slot, active, MAX_STREAMS);
 
    stream->ring = ring;
    strCopy(stream->url, sizeof stream->url, url);
@@ -368,10 +377,11 @@ HttpStream *openHttpStream(const char *url)
 
 int64_t readHttpStream(HttpStream *stream, void *buffer, uint64_t length)
 {
-   int starvedMs = 0;   // how long this call has waited on an empty ring (diagnoses a stalled stream)
+   int starvedMs = 0;
+   int nextStarveLogMs = 3000;
    for (;;) {
       lock(&stream->stateLock);
-      if (!stream->inUse) { unlock(&stream->stateLock); return -1; }
+      if (!stream->inUse || stream->readerCancelled) { unlock(&stream->stateLock); return -1; }
 
       // reader moved off the buffered window (backward past the history): ask the prefetch to reopen. clear
       // atEof too - it described the old position; the reconnect re-establishes end-of-stream at the new one.
@@ -393,11 +403,30 @@ int64_t readHttpStream(HttpStream *stream, void *buffer, uint64_t length)
       if (failed) return -1;
       sleepMs(READER_WAIT_MS);   // nothing buffered yet; let the prefetch thread catch up
       starvedMs += READER_WAIT_MS;
-      if (starvedMs >= 3000) {   // repeats every 3s while starved, so a long stall leaves a trail in the log
+      if (starvedMs >= nextStarveLogMs) {
          logWarn("[http] s%d reader starved %dms at offset %llu\n", stream->slot, starvedMs, (unsigned long long)stream->position);
-         starvedMs = 0;
+         nextStarveLogMs += 3000;
+      }
+      if (starvedMs >= READER_STARVE_LIMIT_MS) {
+         lock(&stream->stateLock);
+         stream->readerCancelled = 1;
+         stream->error = 1;
+         stream->running = 0;   // stop the prefetcher from reconnecting after the consumer has abandoned this stream
+         unlock(&stream->stateLock);
+         logError("[http] s%d read aborted after %dms without data; prefetch stopped\n", stream->slot, starvedMs);
+         return -1;
       }
    }
+}
+
+void cancelHttpStream(HttpStream *stream)
+{
+   if (!stream || !stream->inUse || !stream->lockReady) return;
+   lock(&stream->stateLock);
+   stream->readerCancelled = 1;
+   stream->running = 0;   // the in-flight transport call may finish, but no further reconnect is allowed
+   unlock(&stream->stateLock);
+   logInfo("[http] s%d cancellation requested; prefetch will exit after current transport call\n", stream->slot);
 }
 
 int seekHttpStream(HttpStream *stream, uint64_t offset)
@@ -423,7 +452,14 @@ uint64_t getHttpStreamSize(HttpStream *stream) { return stream ? stream->size : 
 void closeHttpStream(HttpStream *stream)
 {
    if (!stream || !stream->inUse) return;
-   stream->running = 0;
+   if (stream->lockReady) {
+      lock(&stream->stateLock);
+      stream->readerCancelled = 1;
+      stream->running = 0;
+      unlock(&stream->stateLock);
+   } else {
+      stream->running = 0;
+   }
    if (stream->prefetchActive) { joinThread(stream->prefetchThread); stream->prefetchActive = 0; }
    if (stream->lockReady) { destroyLock(&stream->stateLock); stream->lockReady = 0; }
    if (stream->conn) { getActiveTransport()->close(stream->conn); stream->conn = NULL; }
@@ -432,5 +468,8 @@ void closeHttpStream(HttpStream *stream)
 
    lock(&streamsLock);
    stream->inUse = 0;
+   int active = 0;
+   for (int i = 0; i < MAX_STREAMS; i++) if (streams[i].inUse) active++;
    unlock(&streamsLock);
+   logInfo("[http] s%d closed; active streams=%d/%d\n", stream->slot, active, MAX_STREAMS);
 }

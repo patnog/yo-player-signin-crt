@@ -5,7 +5,7 @@
 // player never knows which site a stream came from; it just gets a StreamInfo.
 
 #define MAX_STREAM_URL     2048
-#define MAX_STREAM_FORMATS 24
+#define MAX_STREAM_FORMATS 128
 
 // one selectable stream. url may be empty if the source needs deobfuscation we
 // haven't done yet (e.g. youtube's cipher) -- formatCount still reflects what
@@ -18,6 +18,10 @@ typedef struct {
    int  needsCipher;       // 1 = url is signature-ciphered, not yet playable
    char container[8];      // "mp4"
    char url[MAX_STREAM_URL];
+   char audioTrackId[40];
+   char audioTrackName[64];
+   int  audioIsDefault;
+   int  audioIsAutoDubbed;
    int  isLiveSegmented;   // url is a DASH segment base: fetch "<url>sq/<n>/..." instead of opening it directly
    long liveStartSq;       // earliest segment number available (DVR window start)
    long liveEdgeSq;        // most recent segment number available (live edge)
@@ -37,6 +41,7 @@ typedef struct {
    char description[2048];   // video description, truncated; newlines are real '\n'
    int  captionCount;
    CaptionTrack captions[MAX_CAPTION_TRACKS];
+   char defaultAudioTrackId[40];
    int  durationSeconds;
    int  isLive;            // currently broadcasting: streams need live segment-sequence fetching, not a static moov
    int  formatCount;

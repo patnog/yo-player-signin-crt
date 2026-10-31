@@ -133,22 +133,29 @@ static int connectHost(const char *host, int port)
    int resolvedOk = resolved && resolved->h_addr_list[0];
    if (resolvedOk) memcpy(&address.sin_addr, resolved->h_addr_list[0], sizeof address.sin_addr);
    unlockResolve();
-   if (!resolvedOk) { logError("[tls] dns failed for %s\n", host); return -1; }
+   if (!resolvedOk) { logError("[tls-diag] dns failed host=%s cancelled=%d\n", host, requestsCancelled); return -1; }
    if (requestsCancelled) return -1;
 
    int socketHandle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-   if (socketHandle < 0) { logError("[tls] socket() failed\n"); return -1; }
-   if (!registerSocket(socketHandle)) { socketclose(socketHandle); return -1; }
+   if (socketHandle < 0) { logError("[tls-diag] socket() failed host=%s\n", host); return -1; }
+   if (!registerSocket(socketHandle)) {
+      logWarn("[tls-diag] socket rejected host=%s handle=%d cancelled=%d active-limit=%d\n",
+              host, socketHandle, requestsCancelled, ACTIVE_SOCKET_MAX);
+      socketclose(socketHandle);
+      return -1;
+   }
+   logInfo("[tls-diag] socket registered host=%s handle=%d\n", host, socketHandle);
 
    struct timeval timeout = { SOCKET_TIMEOUT, 0 };
    setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
    setsockopt(socketHandle, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
 
    if (connect(socketHandle, (struct sockaddr *)&address, sizeof address) < 0) {
-      if (!requestsCancelled) logError("[tls] connect failed to %s\n", host);
+      if (!requestsCancelled) logError("[tls-diag] connect failed host=%s handle=%d\n", host, socketHandle);
       closeSocket(socketHandle);
       return -1;
    }
+   logInfo("[tls-diag] tcp connected host=%s handle=%d\n", host, socketHandle);
    return socketHandle;
 }
 
@@ -179,7 +186,11 @@ TlsConn *openTlsConn(const char *host)
    if (socketHandle < 0) return NULL;
 
    TlsConn *conn = malloc(sizeof *conn);
-   if (!conn) { getTlsChannel()->close(socketHandle); return NULL; }
+   if (!conn) {
+      logError("[tls-diag] TlsConn allocation failed host=%s handle=%d\n", host, socketHandle);
+      getTlsChannel()->close(socketHandle);
+      return NULL;
+   }
    conn->socketHandle = socketHandle;
    conn->remaining = -1;
    conn->leftover = NULL;
@@ -204,6 +215,7 @@ TlsConn *openTlsConn(const char *host)
    br_ssl_engine_set_buffer(&conn->client.eng, conn->ioBuffer, sizeof conn->ioBuffer, 1);
    br_ssl_client_reset(&conn->client, host, 0);   // host also sets SNI
    br_sslio_init(&conn->io, &conn->client.eng, readChannel, &conn->socketHandle, writeChannel, &conn->socketHandle);
+   logInfo("[tls-diag] TLS context initialized host=%s conn=%p handle=%d\n", host, conn, socketHandle);
    return conn;
 }
 
@@ -225,6 +237,9 @@ int splitHttpsUrl(const char *url, char *hostOut, int hostCap, const char **path
 void closeTlsConn(TlsConn *conn)
 {
    if (!conn) return;
+   logInfo("[tls-diag] close host=%s conn=%p handle=%d bearssl=%d remaining=%lld keepAlive=%d\n",
+           conn->host, conn, conn->socketHandle, getLastTlsError(conn),
+           (long long)conn->remaining, conn->keepAlive);
    getTlsChannel()->close(conn->socketHandle);
    free(conn);
 }
@@ -240,20 +255,36 @@ int sendTlsRequest(TlsConn *conn, const char *method, const char *httpVersion, i
    // written piecewise, not into a fixed buffer: googlevideo videoplayback urls run to ~2 KB and must not
    // be capped. BearSSL coalesces these small writes into TLS records; the first write drives the handshake.
    if (writeStr(conn, method) || writeStr(conn, " ") || writeStr(conn, path) || writeStr(conn, " ") ||
-       writeStr(conn, httpVersion) || writeStr(conn, "\r\nHost: ") || writeStr(conn, host) || writeStr(conn, "\r\n"))
+       writeStr(conn, httpVersion) || writeStr(conn, "\r\nHost: ") || writeStr(conn, host) || writeStr(conn, "\r\n")) {
+      logError("[tls-diag] request write failed host=%s conn=%p bearssl=%d\n", host, conn, getLastTlsError(conn));
       return -1;
-   if (extraHeaders && *extraHeaders && writeStr(conn, extraHeaders)) return -1;
+   }
+   if (extraHeaders && *extraHeaders && writeStr(conn, extraHeaders)) {
+      logError("[tls-diag] extra-header write failed host=%s conn=%p bearssl=%d\n", host, conn, getLastTlsError(conn));
+      return -1;
+   }
    // a body needs its length, and so does a bodyless write method: PUT/POST/PATCH without a
    // Content-Length is ambiguous to the server (Drive's final, empty upload chunk is one).
    int hasBody = body && bodyLen > 0;
    if (hasBody || (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0)) {
       char contentLength[40];
       snprintf(contentLength, sizeof contentLength, "Content-Length: %d\r\n", hasBody ? bodyLen : 0);
-      if (writeStr(conn, contentLength)) return -1;
+      if (writeStr(conn, contentLength)) {
+         logError("[tls-diag] content-length write failed host=%s bearssl=%d\n", host, getLastTlsError(conn));
+         return -1;
+      }
    }
-   if (writeStr(conn, keepAlive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n")) return -1;
-   if (hasBody && br_sslio_write_all(&conn->io, body, bodyLen) != 0) return -1;
-   return br_sslio_flush(&conn->io) != 0 ? -1 : 0;
+   if (writeStr(conn, keepAlive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n")) {
+      logError("[tls-diag] request terminator write failed host=%s bearssl=%d\n", host, getLastTlsError(conn));
+      return -1;
+   }
+   if (hasBody && br_sslio_write_all(&conn->io, body, bodyLen) != 0) {
+      logError("[tls-diag] request body write failed host=%s bytes=%d bearssl=%d\n", host, bodyLen, getLastTlsError(conn));
+      return -1;
+   }
+   int flushRc = br_sslio_flush(&conn->io);
+   if (flushRc != 0) logError("[tls-diag] request flush failed host=%s bearssl=%d\n", host, getLastTlsError(conn));
+   return flushRc != 0 ? -1 : 0;
 }
 
 // case-insensitive substring test (for the response Connection header).
@@ -330,7 +361,11 @@ int readTlsHead(TlsConn *conn, int *status, uint64_t *totalSize)
       headLen += got;
       if ((bodyStart = findBodyStart(conn->head, headLen)) >= 0) break;
    }
-   if (bodyStart < 0) return -1;   // the caller logs the outcome (stale-reuse retry vs real failure)
+   if (bodyStart < 0) {
+      logError("[tls-diag] response head failed host=%s conn=%p bytes=%d bearssl=%d\n",
+               conn->host, conn, headLen, getLastTlsError(conn));
+      return -1;
+   }
 
    conn->head[bodyStart - 2] = '\0';   // terminate the header text at the blank line's first \r\n
    const char *headers = (const char *)conn->head;
@@ -464,5 +499,9 @@ int64_t recvTls(TlsConn *conn, void *buffer, uint64_t cap)
    // (common for HTTP/1.0 responses; BearSSL flags the missing close_notify as an error, but the HTTP framing
    // is the close). For a length-delimited body a graceful close is EOF, anything else is a real transport error.
    if (conn->remaining < 0) return 0;
-   return getLastTlsError(conn) == BR_ERR_OK ? 0 : -1;
+   int tlsError = getLastTlsError(conn);
+   if (tlsError != BR_ERR_OK)
+      logWarn("[tls-diag] body read failed host=%s conn=%p remaining=%lld bearssl=%d\n",
+              conn->host, conn, (long long)conn->remaining, tlsError);
+   return tlsError == BR_ERR_OK ? 0 : -1;
 }

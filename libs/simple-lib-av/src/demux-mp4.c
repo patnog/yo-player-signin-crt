@@ -622,20 +622,45 @@ static uint64_t seekViaSidx(Mp4Demuxer *demuxer, uint64_t targetNs, int landAfte
    // a version-1 sidx uses 64-bit time/offset fields, so its header runs to byte 40; the >=32 floor
    // above only covers version 0. reject a short v1 box rather than reading past the buffer.
    uint8_t version = sidx[8];
-   if (version != 0 && demuxer->sidxSize < 40) { logWarn("[demux-mp4] seek: sidx too small for v1\n"); return 0; }
+   if (version > 1) { logWarn("[demux-mp4] seek: unsupported sidx version %u\n", version); return 0; }
    uint32_t timescale = readU32BE(sidx + 16);
-   if (timescale == 0) timescale = 1;
-   uint32_t cursor = version == 0 ? 20 + 8 : 20 + 16;   // skip earliest_presentation_time + first_offset
-   uint64_t firstOffset = version == 0 ? readU32BE(sidx + 24) : readU64BE(sidx + 28);
+   if (timescale == 0) { logWarn("[demux-mp4] seek: sidx has zero timescale\n"); return 0; }
+
+   // earliest_presentation_time is the base of the reference timeline. It is not necessarily zero:
+   // DASH media segments can begin at a non-zero tfdt, so treating the first reference as t=0 makes
+   // every seek compare against the wrong interval and can repeatedly land on the first fragment.
+   uint32_t cursor;
+   uint64_t earliestTicks, firstOffset;
+   if (version == 0) {
+      if (demuxer->sidxSize < 32) { logWarn("[demux-mp4] seek: sidx too small for v0\n"); return 0; }
+      earliestTicks = readU32BE(sidx + 20);
+      firstOffset = readU32BE(sidx + 24);
+      cursor = 28;
+   } else {
+      if (demuxer->sidxSize < 40) { logWarn("[demux-mp4] seek: sidx too small for v1\n"); return 0; }
+      earliestTicks = readU64BE(sidx + 20);
+      firstOffset = readU64BE(sidx + 28);
+      cursor = 36;
+   }
    uint32_t referenceCount = readU16BE(sidx + cursor + 2);
    cursor += 4;
+   if (referenceCount == 0 || cursor > demuxer->sidxSize ||
+       referenceCount > (demuxer->sidxSize - cursor) / 12) {
+      logWarn("[demux-mp4] seek: invalid sidx reference table (%u entries)\n", referenceCount);
+      return 0;
+   }
 
    // each reference entry (12 bytes): [reference_type:1][referenced_size:31], subsegment_duration, SAP info.
    // accumulate byte offset + time across the entries. normal seek lands on the subsegment covering the target
    // (the last one starting at/before it); landAfter lands on the first subsegment starting at/after the target
    // (used to skip fully past a segment - the video resumes just after it instead of replaying its tail).
-   uint64_t offset = demuxer->sidxPos + demuxer->sidxSize + firstOffset;   // first subsegment (moof) start
-   uint64_t timeTicks = 0, landOffset = offset, landTicks = 0;
+   uint64_t offset = demuxer->sidxPos + demuxer->sidxSize;
+   if (UINT64_MAX - offset < firstOffset) {
+      logWarn("[demux-mp4] seek: sidx first_offset overflow\n");
+      return 0;
+   }
+   offset += firstOffset;   // first subsegment (moof) start
+   uint64_t timeTicks = earliestTicks, landOffset = offset, landTicks = earliestTicks;
    for (uint32_t i = 0; i < referenceCount && cursor + 12 <= demuxer->sidxSize; i++, cursor += 12) {
       uint32_t sizeField = readU32BE(sidx + cursor);
       uint32_t duration  = readU32BE(sidx + cursor + 4);
@@ -649,7 +674,12 @@ static uint64_t seekViaSidx(Mp4Demuxer *demuxer, uint64_t targetNs, int landAfte
          landOffset = offset;
          landTicks  = timeTicks;
       }
-      offset    += sizeField & 0x7FFFFFFF;   // referenced_size (mask off the reference_type bit)
+      uint64_t referenceBytes = sizeField & 0x7FFFFFFF;
+      if (!referenceBytes || UINT64_MAX - offset < referenceBytes || UINT64_MAX - timeTicks < duration) {
+         logWarn("[demux-mp4] seek: invalid sidx reference %u\n", i);
+         return 0;
+      }
+      offset += referenceBytes;   // referenced_size (mask off the reference_type bit)
       timeTicks += duration;
    }
 
