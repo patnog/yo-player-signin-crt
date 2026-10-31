@@ -82,8 +82,8 @@ static TlsConn *sendReusable(const char *host, const char *path, const char *met
       int sendRc = sendTlsRequest(conn, method, version, keepAlive, host, path, headerBlock, body, bodyLen);
       int headRc = sendRc == 0 ? readTlsHead(conn, status, total) : -2;
       if (sendRc == 0 && headRc == 0) {
-         logInfo("[tls-diag] request ok host=%s conn=%p reused=%d status=%d total=%llu\n",
-                 host, conn, reused, status ? *status : 0, (unsigned long long)(total ? *total : 0));
+         logInfo("[tls-diag] request ok host=%s conn=%p reused=%d keepAlive=%d status=%d total=%llu\n",
+                 host, conn, reused, keepAlive, status ? *status : 0, (unsigned long long)(total ? *total : 0));
          return conn;
       }
 
@@ -134,6 +134,9 @@ static void *openBearssl(const char *method, const char *url, const HttpHeader *
 
       int code = 0;
       uint64_t total = 0;
+      // Streaming deliberately stays out of the HTTP/1.0 idle pool: each query-range request has a
+      // different URL/range and is currently sent with Connection: close. Logs expose this connection
+      // churn; changing it to persistent HTTP/1.1 requires confirming Googlevideo supports reuse first.
       TlsConn *conn = sendReusable(host, path, hop ? "GET" : method, streaming ? "HTTP/1.1" : "HTTP/1.0",
                                    !streaming, headerBlock, hop ? NULL : body, hop ? 0 : bodyLen, &code, &total);
       if (!conn) return NULL;
@@ -142,6 +145,7 @@ static void *openBearssl(const char *method, const char *url, const HttpHeader *
       if (isRedirect(code) && bodyless && hop < MAX_REDIRECTS &&
           getTlsHeader(conn, "location", location, sizeof location) == 0 &&
           strncmp(location, "https://", 8) == 0 && strlen(location) < sizeof target) {
+         logInfo("[tls-diag] redirect hop=%d from=%s to=%s streaming=%d\n", hop, host, location, streaming);
          closeTlsConn(conn);
          strcpy(target, location);
          continue;

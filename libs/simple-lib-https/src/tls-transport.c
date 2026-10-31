@@ -15,6 +15,7 @@
 #include <sys/time.h>
 #include <sys/sys_time.h>     // sys_time_get_current_time (wall clock for cert-date validation)
 #include <sys/random_number.h>
+#include <netex/net.h>
 
 // the bundled root CAs (Google Trust Services + Let's Encrypt), generated in trust-anchors.c
 extern const br_x509_trust_anchor TLS_TRUST_ANCHORS[];
@@ -55,6 +56,25 @@ static volatile int  requestsCancelled;
 #define ACTIVE_SOCKET_MAX 64
 static int activeSockets[ACTIVE_SOCKET_MAX];
 static int activeSocketCount;
+static unsigned long socketCreatedCount;
+static unsigned long socketClosedCount;
+static unsigned long socketCloseFailedCount;
+static unsigned long socketOpenFailedCount;
+static int activeSocketHighWater;
+static TlsConn *activeConnections[ACTIVE_SOCKET_MAX];
+static int activeConnectionCount;
+static unsigned long connectionCreatedCount;
+static unsigned long connectionClosedCount;
+static unsigned long connectionCloseInvalidCount;
+
+static int getActiveSocketCount(void)
+{
+   if (!socketLockReady) return 0;
+   lock(&socketLock);
+   int count = activeSocketCount;
+   unlock(&socketLock);
+   return count;
+}
 
 void initTlsResolver(void)
 {
@@ -70,21 +90,78 @@ static int registerSocket(int handle)
    if (!socketLockReady) return 0;
    lock(&socketLock);
    int accepted = !requestsCancelled && activeSocketCount < ACTIVE_SOCKET_MAX;
-   if (accepted) activeSockets[activeSocketCount++] = handle;
+   if (accepted) {
+      activeSockets[activeSocketCount++] = handle;
+      socketCreatedCount++;
+      if (activeSocketCount > activeSocketHighWater) activeSocketHighWater = activeSocketCount;
+   }
    unlock(&socketLock);
    return accepted;
 }
 
-static void unregisterSocket(int handle)
+static int unregisterSocket(int handle)
 {
-   if (!socketLockReady) return;
+   if (!socketLockReady) return 0;
+   int found = 0;
    lock(&socketLock);
    for (int i = 0; i < activeSocketCount; i++) {
       if (activeSockets[i] != handle) continue;
       activeSockets[i] = activeSockets[--activeSocketCount];
+      found = 1;
       break;
    }
    unlock(&socketLock);
+   return found;
+}
+
+static int isSocketRegistered(int handle)
+{
+   if (!socketLockReady) return 0;
+   int found = 0;
+   lock(&socketLock);
+   for (int i = 0; i < activeSocketCount; i++) {
+      if (activeSockets[i] == handle) { found = 1; break; }
+   }
+   unlock(&socketLock);
+   return found;
+}
+
+static void recordSocketOpenFailure(void)
+{
+   if (!socketLockReady) return;
+   lock(&socketLock);
+   socketOpenFailedCount++;
+   unlock(&socketLock);
+}
+
+static int registerTlsConnection(TlsConn *conn)
+{
+   if (!socketLockReady) return 0;
+   lock(&socketLock);
+   int accepted = activeConnectionCount < ACTIVE_SOCKET_MAX;
+   if (accepted) {
+      activeConnections[activeConnectionCount++] = conn;
+      connectionCreatedCount++;
+   }
+   unlock(&socketLock);
+   return accepted;
+}
+
+static int unregisterTlsConnection(TlsConn *conn)
+{
+   if (!socketLockReady) return 0;
+   int found = 0;
+   lock(&socketLock);
+   for (int i = 0; i < activeConnectionCount; i++) {
+      if (activeConnections[i] != conn) continue;
+      activeConnections[i] = activeConnections[--activeConnectionCount];
+      connectionClosedCount++;
+      found = 1;
+      break;
+   }
+   if (!found) connectionCloseInvalidCount++;
+   unlock(&socketLock);
+   return found;
 }
 
 void setTlsRequestsCancelled(int cancelled)
@@ -93,28 +170,53 @@ void setTlsRequestsCancelled(int cancelled)
    lock(&socketLock);
    requestsCancelled = cancelled != 0;
    if (requestsCancelled)
-      for (int i = 0; i < activeSocketCount; i++) shutdown(activeSockets[i], SHUT_RDWR);
+      for (int i = 0; i < activeSocketCount; i++) netShutdown(activeSockets[i], SHUT_RDWR);
    unlock(&socketLock);
 }
 
 static int readSocket(int handle, void *buffer, int length)
 {
    if (requestsCancelled) return -1;
-   int got = recv(handle, buffer, length, 0);
+   int got = netRecv(handle, buffer, length, 0);
    return got <= 0 ? -1 : got;
 }
 
 static int writeSocket(int handle, const void *data, int length)
 {
    if (requestsCancelled) return -1;
-   int sent = send(handle, data, length, 0);
+   int sent = netSend(handle, data, length, 0);
    return sent <= 0 ? -1 : sent;
 }
 
 static void closeSocket(int handle)
 {
-   unregisterSocket(handle);
-   socketclose(handle);
+   // Keep failed closes in the registry so a failed LV2 close remains visible.
+   int wasRegistered = isSocketRegistered(handle);
+   int closeRc = netClose(handle);
+   int closeError = net_errno;
+   if (closeRc == 0) unregisterSocket(handle);
+   int activeAfter;
+   unsigned long closed, closeFailed, created, openFailed;
+   int highWater;
+   if (socketLockReady) {
+      lock(&socketLock);
+      if (closeRc == 0) socketClosedCount++;
+      else socketCloseFailedCount++;
+      activeAfter = activeSocketCount;
+      closed = socketClosedCount;
+      closeFailed = socketCloseFailedCount;
+      created = socketCreatedCount;
+      openFailed = socketOpenFailedCount;
+      highWater = activeSocketHighWater;
+      unlock(&socketLock);
+   } else {
+      activeAfter = 0;
+      closed = closeFailed = created = openFailed = 0;
+      highWater = 0;
+   }
+   logInfo("[tls-audit] socket-close handle=%d tracked=%d rc=%d errno=%d active=%d created=%lu closed=%lu close-failed=%lu open-failed=%lu high-water=%d\n",
+           handle, wasRegistered, closeRc, closeError, activeAfter, created, closed,
+           closeFailed, openFailed, highWater);
 }
 
 // resolve host and open a TCP connection to port 443. returns the socket, or -1.
@@ -136,22 +238,35 @@ static int connectHost(const char *host, int port)
    if (!resolvedOk) { logError("[tls-diag] dns failed host=%s cancelled=%d\n", host, requestsCancelled); return -1; }
    if (requestsCancelled) return -1;
 
-   int socketHandle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-   if (socketHandle < 0) { logError("[tls-diag] socket() failed host=%s\n", host); return -1; }
-   if (!registerSocket(socketHandle)) {
-      logWarn("[tls-diag] socket rejected host=%s handle=%d cancelled=%d active-limit=%d\n",
-              host, socketHandle, requestsCancelled, ACTIVE_SOCKET_MAX);
-      socketclose(socketHandle);
+   int socketHandle = netSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+   if (socketHandle < 0) {
+      int socketError = net_errno;
+      recordSocketOpenFailure();
+      logError("[tls-audit] socket-open-failed host=%s errno=%d active=%d\n",
+               host, socketError, getActiveSocketCount());
       return -1;
    }
-   logInfo("[tls-diag] socket registered host=%s handle=%d\n", host, socketHandle);
+   if (!registerSocket(socketHandle)) {
+      logWarn("[tls-diag] socket rejected host=%s handle=%d cancelled=%d active=%d active-limit=%d\n",
+              host, socketHandle, requestsCancelled, getActiveSocketCount(), ACTIVE_SOCKET_MAX);
+      int closeRc = netClose(socketHandle);
+      int closeError = net_errno;
+      logInfo("[tls-audit] rejected-socket-close handle=%d rc=%d errno=%d active=%d\n",
+              socketHandle, closeRc, closeError, getActiveSocketCount());
+      return -1;
+   }
+   logInfo("[tls-diag] socket registered host=%s handle=%d active=%d\n",
+           host, socketHandle, getActiveSocketCount());
 
    struct timeval timeout = { SOCKET_TIMEOUT, 0 };
-   setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
-   setsockopt(socketHandle, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
+   netSetSockOpt(socketHandle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+   netSetSockOpt(socketHandle, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
 
-   if (connect(socketHandle, (struct sockaddr *)&address, sizeof address) < 0) {
-      if (!requestsCancelled) logError("[tls-diag] connect failed host=%s handle=%d\n", host, socketHandle);
+   if (netConnect(socketHandle, (struct sockaddr *)&address, sizeof address) < 0) {
+      int connectError = net_errno;
+      if (!requestsCancelled)
+         logError("[tls-audit] connect-failed host=%s handle=%d errno=%d active=%d\n",
+                  host, socketHandle, connectError, getActiveSocketCount());
       closeSocket(socketHandle);
       return -1;
    }
@@ -185,13 +300,19 @@ TlsConn *openTlsConn(const char *host)
    int socketHandle = getTlsChannel()->open(host, TLS_PORT);
    if (socketHandle < 0) return NULL;
 
-   TlsConn *conn = malloc(sizeof *conn);
+   TlsConn *conn = calloc(1, sizeof *conn);
    if (!conn) {
       logError("[tls-diag] TlsConn allocation failed host=%s handle=%d\n", host, socketHandle);
       getTlsChannel()->close(socketHandle);
       return NULL;
    }
    conn->socketHandle = socketHandle;
+   if (!registerTlsConnection(conn)) {
+      logError("[tls-audit] connection registry full conn=%p handle=%d\n", conn, socketHandle);
+      getTlsChannel()->close(socketHandle);
+      free(conn);
+      return NULL;
+   }
    conn->remaining = -1;
    conn->leftover = NULL;
    conn->leftoverLen = 0;
@@ -237,10 +358,25 @@ int splitHttpsUrl(const char *url, char *hostOut, int hostCap, const char **path
 void closeTlsConn(TlsConn *conn)
 {
    if (!conn) return;
-   logInfo("[tls-diag] close host=%s conn=%p handle=%d bearssl=%d remaining=%lld keepAlive=%d\n",
-           conn->host, conn, conn->socketHandle, getLastTlsError(conn),
-           (long long)conn->remaining, conn->keepAlive);
-   getTlsChannel()->close(conn->socketHandle);
+   if (!unregisterTlsConnection(conn)) {
+      logError("[tls-audit] duplicate-or-untracked conn close conn=%p\n", conn);
+      return;
+   }
+   int handle = conn->socketHandle;
+   int tlsError = getLastTlsError(conn);
+   int activeConnections;
+   unsigned long created, closed, invalid;
+   lock(&socketLock);
+   activeConnections = activeConnectionCount;
+   created = connectionCreatedCount;
+   closed = connectionClosedCount;
+   invalid = connectionCloseInvalidCount;
+   unlock(&socketLock);
+   logInfo("[tls-audit] conn-destroy host=%s conn=%p handle=%d bearssl=%d remaining=%lld chunked=%d chunk-left=%lld leftover=%d keepAlive=%d active=%d created=%lu closed=%lu invalid-close=%lu\n",
+           conn->host, conn, handle, tlsError, (long long)conn->remaining,
+           conn->chunked, (long long)conn->chunkLeft, conn->leftoverLen,
+           conn->keepAlive, activeConnections, created, closed, invalid);
+   getTlsChannel()->close(handle);
    free(conn);
 }
 
@@ -501,7 +637,8 @@ int64_t recvTls(TlsConn *conn, void *buffer, uint64_t cap)
    if (conn->remaining < 0) return 0;
    int tlsError = getLastTlsError(conn);
    if (tlsError != BR_ERR_OK)
-      logWarn("[tls-diag] body read failed host=%s conn=%p remaining=%lld bearssl=%d\n",
-              conn->host, conn, (long long)conn->remaining, tlsError);
+      logWarn("[tls-audit] body-read-error host=%s conn=%p handle=%d remaining=%lld want=%llu bearssl=%d\n",
+              conn->host, conn, conn->socketHandle, (long long)conn->remaining,
+              (unsigned long long)want, tlsError);
    return tlsError == BR_ERR_OK ? 0 : -1;
 }

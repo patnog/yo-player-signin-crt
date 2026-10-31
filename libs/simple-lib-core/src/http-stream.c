@@ -62,6 +62,7 @@ struct HttpStream {
    int              slot;          // index in streams[], so the log can tell one stream from another
    int              refused;       // the last open was turned down by the server, not broken by the network
    int              emptyWindows;  // consecutive connections that ended without delivering anything
+   unsigned int     rangeWindowCount; // query-range requests opened for this stream
    int              needReconnect; // reader -> prefetch: position moved off the window, reopen there
    int              errorRetries;  // consecutive failed recv/reconnect attempts (reset on progress)
    volatile int     running;       // prefetch thread runs while set
@@ -166,6 +167,11 @@ static void *openConnection(HttpStream *stream, uint64_t offset, uint64_t *total
          return NULL;
       }
       connEnd = windowEnd + 1;
+      stream->rangeWindowCount++;
+      logInfo("[http-range] s%d request=%u offset=%llu end=%llu window=%llu rate=%llu\n",
+              stream->slot, stream->rangeWindowCount, (unsigned long long)offset,
+              (unsigned long long)windowEnd, (unsigned long long)window,
+              (unsigned long long)stream->bytesPerSecond);
    } else {
       strCopy(request, sizeof request, stream->url);
       formatRange(range, sizeof range, offset);
@@ -190,8 +196,16 @@ static void *openConnection(HttpStream *stream, uint64_t offset, uint64_t *total
       transport->close(conn);
       conn = NULL;
    }
-   if (!conn) return NULL;
+   if (!conn) {
+      if (stream->rangeInQuery)
+         logWarn("[http-range] s%d request=%u open failed offset=%llu refused=%d\n",
+                 stream->slot, stream->rangeWindowCount, (unsigned long long)offset, stream->refused);
+      return NULL;
+   }
 
+   if (stream->rangeInQuery)
+      logInfo("[http-range] s%d request=%u connection opened conn=%p status=%d\n",
+              stream->slot, stream->rangeWindowCount, conn, status);
    stream->connEnd = connEnd;
    return conn;
 }
@@ -239,7 +253,14 @@ static void prefetchThread(uint64_t arg)
       int seeked = needReconnect || position < ringStart || position > ringEnd + FORWARD_RECONNECT;
       if (seeked || windowSpent || !stream->conn) {
          uint64_t offset = seeked ? position : ringEnd;
-         if (stream->conn) { transport->close(stream->conn); stream->conn = NULL; }
+         const char *reopenReason = seeked ? "seek" : (windowSpent ? "window-spent" : "no-connection");
+         if (stream->conn) {
+            if (stream->rangeInQuery)
+               logInfo("[http-range] s%d closing conn=%p reason=%s next-offset=%llu\n",
+                       stream->slot, stream->conn, reopenReason, (unsigned long long)offset);
+            transport->close(stream->conn);
+            stream->conn = NULL;
+         }
 
          uint64_t tReconnect = sys_time_get_system_time();
          void *conn = openConnection(stream, offset, NULL);
@@ -260,6 +281,10 @@ static void prefetchThread(uint64_t arg)
          stream->atEof = 0;
          if (conn) {
             stream->conn = conn;
+            if (stream->rangeInQuery)
+               logInfo("[http-range] s%d active conn=%p reason=%s offset=%llu conn-end=%llu\n",
+                       stream->slot, conn, reopenReason, (unsigned long long)offset,
+                       (unsigned long long)stream->connEnd);
             if (seeked) stream->ringStart = stream->ringEnd = offset;
             stream->needReconnect = 0;
             stream->errorRetries = 0;
@@ -305,7 +330,13 @@ static void prefetchThread(uint64_t arg)
          if (stream->errorRetries < PREFETCH_ERROR_RETRIES) {
             stream->errorRetries++;
             stream->needReconnect = 1;
-            logWarn("[http] recv failed, reconnect attempt %d\n", stream->errorRetries);
+            if (stream->rangeInQuery)
+               logWarn("[http-audit] s%d range-request=%u recv-error conn=%p offset=%llu conn-end=%llu retry=%d empty-windows=%d\n",
+                       stream->slot, stream->rangeWindowCount, stream->conn,
+                       (unsigned long long)ringEnd, (unsigned long long)stream->connEnd,
+                       stream->errorRetries, stream->emptyWindows);
+            else
+               logWarn("[http] recv failed, reconnect attempt %d\n", stream->errorRetries);
          } else {
             stream->error = 1;
          }
@@ -316,6 +347,9 @@ static void prefetchThread(uint64_t arg)
          // reconnect: the zero was the pre-seek connection's end, not the new position's.
          if (stream->size && stream->ringEnd < stream->size && stream->emptyWindows < PREFETCH_ERROR_RETRIES) {
             stream->emptyWindows++;
+            logWarn("[http-audit] s%d range-request=%u empty-window count=%d offset=%llu size=%llu\n",
+                    stream->slot, stream->rangeWindowCount, stream->emptyWindows,
+                    (unsigned long long)stream->ringEnd, (unsigned long long)stream->size);
             stream->connEnd = stream->ringEnd;
          } else {
             stream->atEof = 1;
