@@ -250,6 +250,29 @@ static void parseFormatArray(const char *arrayStart, const char *regionEnd, int 
 // parse the caption track list into out->captions. the list ends where the renderer's next field
 // starts (entries hold nested arrays, so a plain ']' scan would cut early); each entry leads with
 // "baseUrl". the display name sits in the entry's name block as "text" (runs) or "simpleText".
+static int parseCaptionEntry(const char *entry, const char *entryEnd, CaptionTrack *track, int *isAuto)
+{
+   memset(track, 0, sizeof *track);
+   if (!jsonString(entry, entryEnd, "baseUrl", track->url, sizeof track->url) ||
+       !jsonString(entry, entryEnd, "languageCode", track->languageCode, sizeof track->languageCode))
+      return 0;
+   if (!jsonString(entry, entryEnd, "text", track->name, sizeof track->name) &&
+       !jsonString(entry, entryEnd, "simpleText", track->name, sizeof track->name))
+      strCopy(track->name, sizeof track->name, track->languageCode);
+   const char *kind = strstr(entry, "\"kind\":\"asr\"");
+   *isAuto = kind && kind < entryEnd;
+   return 1;
+}
+
+static int isPreferredCaptionLanguage(const char *code)
+{
+   return strcmp(code, "en-US") == 0 || strcmp(code, "pt-BR") == 0;
+}
+
+// Prefer one track each for US English and Brazilian Portuguese, regardless of
+// whether YouTube marks it as creator-provided or auto-generated. If both kinds
+// exist for a language, keep the creator-provided track. The remaining six slots
+// retain the original YouTube ordering.
 static void parseCaptionTracks(const char *resp, const char *end, StreamInfo *out)
 {
    const char *captions = strstr(resp, "\"captionTracks\"");
@@ -258,24 +281,48 @@ static void parseCaptionTracks(const char *resp, const char *end, StreamInfo *ou
    if (!listEnd) listEnd = strstr(captions, "\"translationLanguages\"");
    if (!listEnd) listEnd = end;
 
+   static const char *preferred[] = { "en-US", "pt-BR" };
+   for (int wanted = 0; wanted < 2 && out->captionCount < MAX_CAPTION_TRACKS; wanted++) {
+      CaptionTrack best;
+      int found = 0, bestAuto = 1;
+      const char *scan = captions;
+      while (scan < listEnd) {
+         const char *entry = strstr(scan, "\"baseUrl\"");
+         if (!entry || entry >= listEnd) break;
+         const char *next = strstr(entry + 1, "\"baseUrl\"");
+         const char *entryEnd = (next && next < listEnd) ? next : listEnd;
+         CaptionTrack candidate;
+         int isAuto = 0;
+         if (parseCaptionEntry(entry, entryEnd, &candidate, &isAuto) &&
+             strcmp(candidate.languageCode, preferred[wanted]) == 0 &&
+             (!found || (bestAuto && !isAuto))) {
+            best = candidate;
+            bestAuto = isAuto;
+            found = 1;
+         }
+         scan = entryEnd;
+      }
+      if (found) out->captions[out->captionCount++] = best;
+   }
+
+   // Fill the remaining slots with the first six other tracks in YouTube order.
    const char *scan = captions;
-   while (out->captionCount < MAX_CAPTION_TRACKS) {
+   int ordinaryCount = 0;
+   while (ordinaryCount < MAX_CAPTION_TRACKS - 2 && out->captionCount < MAX_CAPTION_TRACKS) {
       const char *entry = strstr(scan, "\"baseUrl\"");
       if (!entry || entry >= listEnd) break;
       const char *next = strstr(entry + 1, "\"baseUrl\"");
       const char *entryEnd = (next && next < listEnd) ? next : listEnd;
-
-      CaptionTrack *track = &out->captions[out->captionCount];
-      if (jsonString(entry, entryEnd, "baseUrl", track->url, sizeof track->url) &&
-          jsonString(entry, entryEnd, "languageCode", track->languageCode, sizeof track->languageCode)) {
-         if (!jsonString(entry, entryEnd, "text", track->name, sizeof track->name) &&
-             !jsonString(entry, entryEnd, "simpleText", track->name, sizeof track->name))
-            strCopy(track->name, sizeof track->name, track->languageCode);
-         out->captionCount++;
+      CaptionTrack track;
+      int isAuto = 0;
+      if (parseCaptionEntry(entry, entryEnd, &track, &isAuto) &&
+          !isPreferredCaptionLanguage(track.languageCode)) {
+         out->captions[out->captionCount++] = track;
+         ordinaryCount++;
       }
       scan = entryEnd;
    }
-   if (out->captionCount) logInfo("[yt] %d caption track(s)\n", out->captionCount);
+   if (out->captionCount) logInfo("[yt] %d caption track(s) (US English / pt-BR prioritized)\n", out->captionCount);
 }
 
 // parse both stream arrays. iOS returns only adaptiveFormats (separate video and
