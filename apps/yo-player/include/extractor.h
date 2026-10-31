@@ -146,3 +146,6 @@ int getAccountFeed(AccountFeed feed, const char *continuation, SearchResults *ou
 
 // Resolve a video's owning channel ID on demand. Blocking network request.
 int getVideoChannelId(const char *videoId, char *channelId, int channelIdCap);
+
+// Resolve the first playable recommendation from YouTube's WEB /next response.
+int getNextVideoId(const char *videoId, char *nextVideoId, int nextVideoIdCap, char *nextTitle, int nextTitleCap);

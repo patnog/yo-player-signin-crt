@@ -27,6 +27,7 @@
 
 #include "video-player.h"
 #include "http.h"               // cancel network I/O before joining playback workers
+#include "image-loader.h"       // decode the autoplay thumbnail without blocking the render thread
 #include "storage.h"            // resume position (get/setWatchedPosition)
 #include "settings.h"           // sponsorblock-mode (which segment categories auto-skip)
 #include "sponsorblock.h"       // skip segments (auto-skip + seek-bar marks)
@@ -38,6 +39,7 @@
 #include <stdlib.h>
 #include <stdio.h>              // snprintf (stats overlay)
 #include <sys/sys_time.h>       // sys_time_get_system_time (fps measure)
+#include <math.h>                // autoplay countdown ring
 
 // volume: up/down step the shared pill meter (ui/volume-meter.h), pills in the theme accent.
 #define VOLUME_DEFAULT    12
@@ -48,6 +50,8 @@
 #define SEEK_APPLY_IDLE_US  400000ULL
 #define CONTROLS_VISIBLE_US 3000000ULL
 #define TOAST_VISIBLE_US    2000000ULL   // how long a toast ("Skipped ...", "Subtitles: ...") stays up
+#define AUTOPLAY_NOTICE_US  3000000ULL
+#define AUTOPLAY_THUMB_CAP  (128 * 1024)
 
 // subtitles: triangle cycles off -> track 1 -> track 2 -> ... -> off; the active cue draws above the
 // seek bar, and the HUD shows the chosen language top-right while the controls are up.
@@ -81,6 +85,16 @@ static struct {
    int              pauseWhenReady; // preserve Cross presses made before the first frame/player adoption
    int              threadActive;
    sys_ppu_thread_t workerTid;
+   volatile int     nextWorkerDone;
+   int              nextThreadActive, nextAttempted;
+   sys_ppu_thread_t nextWorkerTid;
+   char             nextVideoId[16];
+   char             nextVideoTitle[256];
+   uint8_t         *nextThumbJpeg;
+   int              nextThumbJpegLen;
+   GfxTexture       nextThumbTexture;
+   int              nextNoticeVisible, nextImageRequested;
+   uint64_t         nextNoticeStartedUs;
    VideoPlayer     *player;
    int              screenW, screenH;
    int              firstFrameSeen;   // a real frame has been presented (loading status ends, save is safe)
@@ -180,6 +194,8 @@ static Label statLabels[STAT_LINES];
 static Label timeLeftLabel, timeRightLabel;   // seek bar: current time (left) / total (right)
 static Label toastLabel;                      // brief centred toast ("Skipped ...", "Subtitles: ...")
 static Label titleLabel;                      // video title, top-left while the seek bar is up
+static Label nextNoticeHeadingLabel;           // "next video" notice heading
+static Label nextNoticeTitleLabel;             // selected autoplay video title
 static Label subtitleLabel;                   // active subtitle cue, above the seek bar
 static Label subsHudLabel;                    // chosen subtitle language, top-right while the HUD is up
 static Label chapterLabels[MAX_CHAPTERS];     // chapter titles (picker overlay rows)
@@ -425,6 +441,37 @@ static void chapterWorker(uint64_t arg)
    exitThread();
 }
 
+// Resolve YouTube's next recommendation off the UI thread; playback is untouched if this fails.
+static void autoplayWorker(uint64_t arg)
+{
+   (void)arg;
+   if (getNextVideoId(requestedInput, state.nextVideoId, sizeof state.nextVideoId,
+                      state.nextVideoTitle, sizeof state.nextVideoTitle) == 0) {
+      uint8_t *jpeg = (uint8_t *)malloc(AUTOPLAY_THUMB_CAP);
+      if (jpeg) {
+         char url[128];
+         snprintf(url, sizeof url, "https://i.ytimg.com/vi/%s/mqdefault.jpg", state.nextVideoId);
+         HttpHeader headers[] = {
+            { "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36" },
+            { "Accept-Encoding", "identity" }
+         };
+         int length = 0, status = 0;
+         int rc = fetchHttp("GET", url, headers, 2, NULL, 0, (char *)jpeg,
+                            AUTOPLAY_THUMB_CAP, &length, &status);
+         if (rc == 0 && status == 200 && length > 0) {
+            state.nextThumbJpeg = jpeg;
+            state.nextThumbJpegLen = length;
+         } else {
+            logWarn("[yt] autoplay thumbnail failed rc=%d status=%d\n", rc, status);
+            free(jpeg);
+         }
+      }
+   }
+   __sync_synchronize();
+   state.nextWorkerDone = 1;
+   exitThread();
+}
+
 void playVideo(const char *input)
 {
    strCopy(requestedInput, sizeof requestedInput, input);
@@ -446,6 +493,8 @@ static void initPlay(void)
    initLabel(&timeRightLabel, &uiFont, 0, 0, 200, AUTO, 22, activeTheme->textPrimary, TEXT_NOWRAP, "");
    initLabelRaw(&toastLabel, &uiFont, 0, 0, 400, AUTO, 22, activeTheme->textPrimary, TEXT_NOWRAP, "");   // raw: shows track names
    initLabelRaw(&titleLabel, &uiFont, 0, 0, 1100, AUTO, 22, activeTheme->textPrimary, TEXT_NOWRAP_ELLIPSIS, "");
+   initLabelRaw(&nextNoticeHeadingLabel, &uiFont, 0, 0, 500, AUTO, 22, activeTheme->accent, TEXT_NOWRAP, "NEXT VIDEO");
+   initLabelRaw(&nextNoticeTitleLabel, &uiFont, 0, 0, 1040, AUTO, 30, activeTheme->textPrimary, TEXT_NOWRAP_ELLIPSIS, "");
    initLabelRaw(&subtitleLabel, &uiFont, 0, 0, state.screenW - 160, AUTO, SUBTITLE_TEXT_SIZE, activeTheme->textPrimary, TEXT_WRAP, "");
    initLabelRaw(&subsHudLabel, &uiFont, 0, 0, 500, AUTO, 22, activeTheme->textPrimary, TEXT_NOWRAP_ELLIPSIS, "");
    for (int i = 0; i < MAX_CHAPTERS; i++) {
@@ -999,6 +1048,50 @@ static void updatePlay(void)
       }
    }
 
+   if (state.nextWorkerDone && state.nextThreadActive) {
+      joinThread(state.nextWorkerTid);
+      state.nextThreadActive = 0;
+      if (state.nextVideoId[0]) {
+         if (!state.nextVideoTitle[0])
+            snprintf(state.nextVideoTitle, sizeof state.nextVideoTitle, "Video %s", state.nextVideoId);
+         setLabelText(&nextNoticeTitleLabel, state.nextVideoTitle);
+         state.nextNoticeVisible = 1;
+         state.nextNoticeStartedUs = sys_time_get_system_time();
+         if (state.nextThumbJpeg && state.nextThumbJpegLen > 0) {
+            if (requestImageMemAsync(state.nextThumbJpeg, (uint32_t)state.nextThumbJpegLen) == 0)
+               state.nextImageRequested = 1;
+            free(state.nextThumbJpeg);
+            state.nextThumbJpeg = NULL;
+            state.nextThumbJpegLen = 0;
+         }
+      } else {
+         showToast("No next recommendation");
+      }
+   }
+
+   if (state.nextImageRequested && !state.nextThumbTexture.offset) {
+      ImageBuffer decoded;
+      int imageResult = pollImageAsync(&decoded);
+      if (imageResult == 1) {
+         state.nextThumbTexture = uploadImageBuffer(&decoded);
+         freeImageBuffer(&decoded);
+         state.nextImageRequested = 0;
+      } else if (imageResult < 0) {
+         state.nextImageRequested = 0;
+      }
+   }
+
+   if (state.nextNoticeVisible &&
+       sys_time_get_system_time() - state.nextNoticeStartedUs >= AUTOPLAY_NOTICE_US) {
+      char nextId[16];
+      strCopy(nextId, sizeof nextId, state.nextVideoId);
+      state.nextNoticeVisible = 0;
+      if (state.nextThumbTexture.offset) retireGfxTexture(&state.nextThumbTexture);
+      popScreen();
+      playVideo(nextId);
+      return;
+   }
+
    // reap the sponsorblock fetch; its segments are safe to read once joined
    if (state.sbWorkerDone && state.sbThreadActive) {
       joinThread(state.sbWorkerTid);
@@ -1049,6 +1142,17 @@ static void updatePlay(void)
       handlePlaybackInput();
    if (state.sbReady && state.stage == STAGE_PLAYING && state.player && !isVideoPaused(state.player) && !state.seeking)
       autoSkipSponsor();
+
+   // Automatic playback: ask /next once after a VOD reaches its end. Network failure is non-fatal.
+   if (state.stage == STAGE_PLAYING && state.player && !state.isLive &&
+       isVideoEnded(state.player) && !state.nextAttempted && !state.nextThreadActive) {
+      state.nextAttempted = 1;
+      state.nextWorkerDone = 0;
+      state.nextVideoId[0] = 0;
+      state.nextThreadActive = (spawnJoinableThread(&state.nextWorkerTid, autoplayWorker, 0,
+                                THREAD_PRIORITY_DEFAULT, THREAD_STACK_SIZE_64KB, "yt-autoplay") == 0);
+      if (!state.nextThreadActive) showToast("Autoplay unavailable");
+   }
 
    // status text: the failure reason, or "Loading..." until playback. setLabelText skips unchanged
    // text, so calling it each frame only rasterises on a real change.
@@ -1267,6 +1371,50 @@ static void getCropToFillRect(int frameW, int frameH, int *dx, int *dy, int *dw,
    }
 }
 
+static void drawAutoplayNotice(void)
+{
+   uint64_t now = sys_time_get_system_time();
+   float elapsed = (float)(now - state.nextNoticeStartedUs) / (float)AUTOPLAY_NOTICE_US;
+   if (elapsed < 0.0f) elapsed = 0.0f;
+   if (elapsed > 1.0f) elapsed = 1.0f;
+
+   fillGfxRectangle(0, 0, state.screenW, state.screenH, 0xB8000000);
+   int panelW = 1120, panelH = 610;
+   int panelX = (state.screenW - panelW) / 2;
+   int panelY = (state.screenH - panelH) / 2;
+   fillGfxRectangle(panelX, panelY, panelW, panelH, activeTheme->surface);
+   strokeGfxRectangle(panelX, panelY, panelW, panelH, 2, activeTheme->focusBorder);
+
+   // The thumbnail is centred and kept at 16:9. A placeholder remains if download/decode fails.
+   int headingX = state.screenW / 2 - nextNoticeHeadingLabel.tt.tex.w / 2;
+   drawLabelAt(&nextNoticeHeadingLabel, headingX, panelY + 8);
+   int thumbW = 800, thumbH = 450;
+   int thumbX = state.screenW / 2 - thumbW / 2;
+   int thumbY = panelY + 42;
+   if (state.nextThumbTexture.offset) {
+      drawGfxTextureFixedSize(thumbX, thumbY, thumbW, thumbH, state.nextThumbTexture,
+                              0.0f, 0.0f, 1.0f, 1.0f, 0xFFFFFFFF, GFX_FILTER_LINEAR);
+   } else {
+      fillGfxRectangle(thumbX, thumbY, thumbW, thumbH, activeTheme->scrim);
+   }
+
+   int titleX = state.screenW / 2 - nextNoticeTitleLabel.tt.tex.w / 2;
+   int titleY = thumbY + thumbH + 18;
+   if (titleX < panelX + 30) titleX = panelX + 30;
+   drawLabelAt(&nextNoticeTitleLabel, titleX, titleY);
+
+   // 24 dots form a countdown ring; the lit arc grows as the five-second delay elapses.
+   int cx = state.screenW / 2, cy = panelY + panelH - 32;
+   int radius = 20;
+   int lit = (int)(elapsed * 24.0f + 0.5f);
+   for (int i = 0; i < 24; i++) {
+      float angle = -1.5707963f + (float)i * 6.2831853f / 24.0f;
+      int x = cx + (int)(cosf(angle) * radius);
+      int y = cy + (int)(sinf(angle) * radius);
+      fillGfxCircle(x, y, 4, i < lit ? activeTheme->accent : activeTheme->textSecondary);
+   }
+}
+
 static void drawPlay(void)
 {
    // The SD UI zoom is intended for library/navigation screens only. Keep all playback
@@ -1296,6 +1444,7 @@ static void drawPlay(void)
       if (state.stage == STAGE_PLAYING && !overlayUp) { drawSubtitle(); drawToast(); drawVolumeMeter(&volumeMeter); }
       if (state.chaptersVisible) drawChapters();
       if (state.descriptionVisible) drawDescription();
+      if (state.nextNoticeVisible) drawAutoplayNotice();
    }
 
    // until the first frame is presented (open, then the async resume seek's reload) keep the loading
@@ -1319,6 +1468,7 @@ static void termPlay(void)
    if (state.audioSwitchThreadActive) { joinThread(state.audioSwitchTid); state.audioSwitchThreadActive = 0; }
    if (state.resolutionSwitchThreadActive) { joinThread(state.resolutionSwitchTid); state.resolutionSwitchThreadActive = 0; }
    if (state.chThreadActive) { joinThread(state.chWorkerTid); state.chThreadActive = 0; }
+   if (state.nextThreadActive) { joinThread(state.nextWorkerTid); state.nextThreadActive = 0; }
    free(state.subtitleTrack);
    state.subtitleTrack = NULL;
    // save the resume position on the way out; a finished video is saved as 0 so it restarts next time.
@@ -1338,11 +1488,16 @@ static void termPlay(void)
    freeLabel(&timeRightLabel);
    freeLabel(&toastLabel);
    freeLabel(&titleLabel);
+   freeLabel(&nextNoticeHeadingLabel);
+   freeLabel(&nextNoticeTitleLabel);
    freeLabel(&subtitleLabel);
    freeLabel(&subsHudLabel);
    for (int i = 0; i < MAX_CHAPTERS; i++) { freeLabel(&chapterLabels[i]); freeLabel(&chapterTimeLabels[i]); }
    freeVolumeMeter(&volumeMeter);
    freeTextTexture(&descriptionTexture);
+   if (state.nextThumbJpeg) { free(state.nextThumbJpeg); state.nextThumbJpeg = NULL; }
+   if (state.nextImageRequested) cancelImageAsync();
+   if (state.nextThumbTexture.offset) { finishGfx(); freeGfxTexture(&state.nextThumbTexture); }
    closeFont(&uiFont);
    setHttpRequestsCancelled(0);
 }

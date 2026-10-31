@@ -89,6 +89,8 @@ static const char *SEARCH_BODY_FMT = WEB_CONTEXT ",\"query\":\"%s\",\"params\":\
 // logged-out. two %s: browseId, params. see TRENDING_CATEGORIES for the ids.
 static const char *TRENDING_BODY_FMT = WEB_CONTEXT ",\"browseId\":\"%s\",\"params\":\"%s\"}";
 static const char *CONTINUATION_BODY_FMT = WEB_CONTEXT ",\"continuation\":\"%s\"}";   // next page of any feed
+#define NEXT_URL "https://www.youtube.com/youtubei/v1/next?prettyPrint=false"
+#define NEXT_BODY_FMT "{\"context\":{\"client\":{\"clientName\":\"WEB\",\"clientVersion\":\"%s\",\"hl\":\"en\",\"gl\":\"US\"}},\"videoId\":\"%s\"}"
 
 static int hex4(const char *p)
 {
@@ -527,6 +529,75 @@ static int youtubeGetVideoChannelId(const char *videoId, char *channelId, int ch
    }
    free(resp);
    return found ? 0 : -1;
+}
+
+
+int getNextVideoId(const char *videoId, char *nextVideoId, int nextVideoIdCap, char *nextTitle, int nextTitleCap)
+{
+   if (!videoId || !videoId[0] || !nextVideoId || nextVideoIdCap < 12) return -1;
+   nextVideoId[0] = 0;
+   if (nextTitle && nextTitleCap > 0) nextTitle[0] = 0;
+
+   char body[512];
+   int bodyLen = snprintf(body, sizeof body, NEXT_BODY_FMT, WEB_VERSION, videoId);
+   if (bodyLen <= 0 || bodyLen >= (int)sizeof body) return -1;
+
+   char *resp = malloc(RESP_CAP);
+   if (!resp) return -1;
+
+   HttpHeader headers[] = {
+      { "Content-Type", "application/json" },
+      { "User-Agent", WEB_UA },
+      { "X-YouTube-Client-Name", "1" },
+      { "X-YouTube-Client-Version", WEB_VERSION },
+      { "Origin", "https://www.youtube.com" },
+      { "Accept-Encoding", "identity" },
+   };
+   int respLen = 0, status = 0;
+   int rc = fetchHttp("POST", NEXT_URL, headers, sizeof headers / sizeof headers[0],
+                      body, bodyLen, resp, RESP_CAP, &respLen, &status);
+   if (rc < 0 || status != 200) {
+      logWarn("[yt] autoplay /next failed rc=%d status=%d\n", rc, status);
+      free(resp);
+      return rc < 0 ? rc : -status;
+   }
+
+   const char *end = resp + respLen;
+   const char *secondary = strstr(resp, "\"secondaryResults\"");
+   const char *results = secondary && secondary < end ? strstr(secondary, "\"results\":[") : NULL;
+   if (results && results < end) {
+      const char *scan = results + 10;
+      while (scan < end) {
+         const char *item = strstr(scan, "\"lockupViewModel\":{");
+         if (!item || item >= end) break;
+         const char *next = strstr(item + 1, "\"lockupViewModel\":{");
+         const char *itemEnd = next && next < end ? next : end;
+         char candidate[16] = "";
+         if (jsonString(item, itemEnd, "contentId", candidate, sizeof candidate) &&
+             strlen(candidate) == 11 && strcmp(candidate, videoId) != 0) {
+            int valid = 1;
+            for (int i = 0; i < 11; i++) if (!isIdChar(candidate[i])) valid = 0;
+            if (valid) {
+               strCopy(nextVideoId, nextVideoIdCap, candidate);
+               if (nextTitle && nextTitleCap > 0) {
+                  const char *metadata = strstr(item, "\"lockupMetadataViewModel\"");
+                  const char *title = metadata && metadata < itemEnd ? strstr(metadata, "\"title\":{") : NULL;
+                  if (title && title < itemEnd)
+                     jsonString(title, itemEnd, "content", nextTitle, nextTitleCap);
+               }
+               break;
+            }
+         }
+         scan = itemEnd;
+      }
+   }
+   free(resp);
+   if (!nextVideoId[0]) {
+      logWarn("[yt] autoplay: no recommendation in /next response\n");
+      return -1;
+   }
+   logInfo("[yt] autoplay recommendation: %s -> %s\n", videoId, nextVideoId);
+   return 0;
 }
 
 static int extract(const char *input, StreamInfo *out)
