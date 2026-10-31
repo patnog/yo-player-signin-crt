@@ -1070,17 +1070,29 @@ static void measureFps(const uint8_t *frame)
 // rasterises when a value actually moves (fps + time once a second).
 static void updateStatLabels(void)
 {
-   char line[96];
+   char line[160];
    int rate = 0, channels = 0;
+   const char *audioName = NULL;
    getAudioTrackInfo(state.player, &rate, &channels);
    float pos = getVideoPositionSeconds(state.player), duration = getVideoDurationSeconds(state.player);
+
+   if (state.audioPick >= 0 && state.audioPick < state.audioCount)
+      audioName = state.audioNames[state.audioPick];
 
    snprintf(line, sizeof line, "Video  itag %d   %dx%d   H.264", state.vidItag, state.vidW, state.vidH);
    setLabelText(&statLabels[0], line);
    snprintf(line, sizeof line, "FPS  %d   (target %d)", state.measuredFps, state.vidFps);
    setLabelText(&statLabels[1], line);
-   if (state.audItag) snprintf(line, sizeof line, "Audio  itag %d   AAC %d Hz   %d ch", state.audItag, rate, channels);
-   else               strCopy(line, sizeof line, "Audio  none");
+   if (state.audItag) {
+      if (audioName && audioName[0])
+         snprintf(line, sizeof line, "Audio  itag %d   %s   AAC %d Hz   %d ch",
+                  state.audItag, audioName, rate, channels);
+      else
+         snprintf(line, sizeof line, "Audio  itag %d   AAC %d Hz   %d ch",
+                  state.audItag, rate, channels);
+   } else {
+      strCopy(line, sizeof line, "Audio  none");
+   }
    setLabelText(&statLabels[2], line);
    snprintf(line, sizeof line, "Time  %d:%02d / %d:%02d", (int)pos / 60, (int)pos % 60, (int)duration / 60, (int)duration % 60);
    setLabelText(&statLabels[3], line);

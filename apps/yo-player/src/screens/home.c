@@ -15,6 +15,7 @@
 #include "gfx.h"
 #include "theme.h"
 #include "pad.h"
+#include "thread.h"             // getTimeUs
 #include "font.h"
 #include "ui/label.h"
 #include "screen-manager.h"
@@ -64,6 +65,18 @@ static int           categoryCached[HOME_CAT_COUNT];
 static int           subsRevisionSeen;         // subscriptions revision the cached HOME_SUBS feed was built at
 static int           watchLaterRevisionSeen;   // watch-later revision the cached HOME_WATCHLATER feed was built at
 static int           accountRevisionSeen;      // sign-in state the category order + account caches belong to
+static uint64_t      accountFeedRefreshUs[ACCOUNT_FEED_COUNT];
+
+// Account feeds refresh periodically while visible. History is deliberately excluded here: it is
+// fetched fresh every time its tab is entered, regardless of its previous cache age.
+#define ACCOUNT_HOME_REFRESH_US          (15ULL * 60 * 1000000)
+#define ACCOUNT_SUBSCRIPTIONS_REFRESH_US (10ULL * 60 * 1000000)
+#define ACCOUNT_HISTORY_REFRESH_US       (5ULL * 60 * 1000000)
+#define ACCOUNT_WATCH_LATER_REFRESH_US   (5ULL * 60 * 1000000)
+static const uint64_t AccountFeedRefreshIntervals[ACCOUNT_FEED_COUNT] = {
+   ACCOUNT_HOME_REFRESH_US, ACCOUNT_SUBSCRIPTIONS_REFRESH_US,
+   ACCOUNT_HISTORY_REFRESH_US, ACCOUNT_WATCH_LATER_REFRESH_US
+};
 
 static struct {
    VideoGrid grid;
@@ -222,9 +235,35 @@ static void setHeading(void)
    setLabelText(&titleLabel, heading);
 }
 
+static void refreshCurrentCategory(void)
+{
+   categoryCached[home.category] = 0;
+   if (home.category >= HOME_ACCOUNT) {
+      int feed = home.category - HOME_ACCOUNT;
+      accountFeedRefreshUs[feed] = getTimeUs();
+   }
+   logInfo("[home] manual/periodic refresh category=%d\n", home.category);
+   setGridSource(&home.grid, homeFetch, NULL);
+}
+
 static void loadCategory(void)
 {
    setHeading();
+   if (home.category >= HOME_ACCOUNT) {
+      int feed = home.category - HOME_ACCOUNT;
+      uint64_t now = getTimeUs();
+      uint64_t last = accountFeedRefreshUs[feed];
+      int forceHistory = feed == ACCOUNT_FEED_HISTORY;
+      int expired = !last || now - last >= AccountFeedRefreshIntervals[feed];
+      if (forceHistory || expired || !categoryCached[home.category]) {
+         categoryCached[home.category] = 0;
+         accountFeedRefreshUs[feed] = now;
+         setGridSource(&home.grid, homeFetch, NULL);
+      } else {
+         setGridCached(&home.grid, &categoryCache[home.category], homeFetch, NULL);
+      }
+      return;
+   }
    if (categoryCached[home.category]) setGridCached(&home.grid, &categoryCache[home.category], homeFetch, NULL);
    else                               setGridSource(&home.grid, homeFetch, NULL);
 }
@@ -255,7 +294,10 @@ static void switchCategory(int delta)
 static void applyAccountChange(void)
 {
    accountRevisionSeen = getAccountRevision();
-   for (int feed = 0; feed < ACCOUNT_FEED_COUNT; feed++) categoryCached[HOME_ACCOUNT + feed] = 0;
+   for (int feed = 0; feed < ACCOUNT_FEED_COUNT; feed++) {
+      categoryCached[HOME_ACCOUNT + feed] = 0;
+      accountFeedRefreshUs[feed] = 0;
+   }
    setAccountHintCaption(isSignedIn() ? "Account" : "Sign in");
    home.category = isSignedIn() ? HOME_ACCOUNT + ACCOUNT_FEED_HOME : HOME_SUBS;
    loadCategory();
@@ -456,12 +498,22 @@ static void updateHome(void)
 
    if (isPadButtonPressed(PAD_BTN_START)) oskInputBegin("Search YouTube", "", onQueryEntered);
    if (isPadButtonPressed(PAD_BTN_SELECT)) { openAccountPanel(); return; }
+   if (isPadButtonPressed(PAD_BTN_R2)) { refreshCurrentCategory(); return; }
 
    // L1/R1 stay responsive even mid-load (the source swap is non-blocking)
    if      (isPadButtonPressed(PAD_BTN_R1)) { switchCategory(1);  return; }
    else if (isPadButtonPressed(PAD_BTN_L1)) { switchCategory(-1); return; }
 
    updateVideoGrid(&home.grid);
+   if (home.category >= HOME_ACCOUNT && gridStage(&home.grid) == GRID_READY && !home.grid.threadActive) {
+      int feed = home.category - HOME_ACCOUNT;
+      uint64_t now = getTimeUs();
+      if (feed != ACCOUNT_FEED_HISTORY && accountFeedRefreshUs[feed] &&
+          now - accountFeedRefreshUs[feed] >= AccountFeedRefreshIntervals[feed]) {
+         refreshCurrentCategory();
+         return;
+      }
+   }
    if (gridStage(&home.grid) != GRID_READY) return;
 
    const SearchResult *selected = gridSelected(&home.grid);
@@ -529,6 +581,10 @@ static void suspendHome(void) { stopVideoGrid(&home.grid); }   // free the http 
 // already-loaded grid is kept as-is (instant, thumbnails intact).
 static void resumeHome(void)
 {
+   if (home.category == HOME_ACCOUNT + ACCOUNT_FEED_HISTORY) {
+      loadCategory();
+      return;
+   }
    // a subscribe/unsubscribe while we were away makes the cached Subscriptions feed stale - drop it and,
    // if it's the current tab, refetch now.
    if (getSubscriptionsRevision() != subsRevisionSeen) {
