@@ -532,7 +532,7 @@ static int youtubeGetVideoChannelId(const char *videoId, char *channelId, int ch
 }
 
 
-int getNextVideoId(const char *videoId, char *nextVideoId, int nextVideoIdCap, char *nextTitle, int nextTitleCap)
+int getNextVideoId(const char *videoId, char *nextVideoId, int nextVideoIdCap, char *nextTitle, int nextTitleCap, const char watchedIds[][12], int watchedCount)
 {
    if (!videoId || !videoId[0] || !nextVideoId || nextVideoIdCap < 12) return -1;
    nextVideoId[0] = 0;
@@ -577,7 +577,16 @@ int getNextVideoId(const char *videoId, char *nextVideoId, int nextVideoIdCap, c
              strlen(candidate) == 11 && strcmp(candidate, videoId) != 0) {
             int valid = 1;
             for (int i = 0; i < 11; i++) if (!isIdChar(candidate[i])) valid = 0;
+            int alreadyWatched = 0;
             if (valid) {
+               for (int i = 0; i < watchedCount; i++) {
+                  if (strcmp(candidate, watchedIds[i]) == 0) {
+                     alreadyWatched = 1;
+                     break;
+                  }
+               }
+            }
+            if (valid && !alreadyWatched) {
                strCopy(nextVideoId, nextVideoIdCap, candidate);
                if (nextTitle && nextTitleCap > 0) {
                   const char *metadata = strstr(item, "\"lockupMetadataViewModel\"");
@@ -587,6 +596,8 @@ int getNextVideoId(const char *videoId, char *nextVideoId, int nextVideoIdCap, c
                }
                break;
             }
+            if (alreadyWatched)
+               logInfo("[yt] autoplay skipped watched recommendation: %s\n", candidate);
          }
          scan = itemEnd;
       }

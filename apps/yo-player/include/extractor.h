@@ -148,4 +148,4 @@ int getAccountFeed(AccountFeed feed, const char *continuation, SearchResults *ou
 int getVideoChannelId(const char *videoId, char *channelId, int channelIdCap);
 
 // Resolve the first playable recommendation from YouTube's WEB /next response.
-int getNextVideoId(const char *videoId, char *nextVideoId, int nextVideoIdCap, char *nextTitle, int nextTitleCap);
+int getNextVideoId(const char *videoId, char *nextVideoId, int nextVideoIdCap, char *nextTitle, int nextTitleCap, const char watchedIds[][12], int watchedCount);

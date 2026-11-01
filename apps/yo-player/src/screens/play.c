@@ -75,6 +75,118 @@
 // a short public clip so pushing the screen directly still does something.
 static char requestedInput[256] = "jNQXAC9IVRw";   // "Me at the zoo"
 
+// Playback navigation: the current video plus the two most recent predecessors.
+// The cursor allows L1 to move backward; a new video after going back discards the forward branch.
+#define PLAYBACK_NAV_CAP 3
+static char playbackNavIds[PLAYBACK_NAV_CAP][12];
+static int playbackNavCount;
+static int playbackNavCursor = -1;
+
+static int playbackIdChar(char c)
+{
+   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '-';
+}
+
+static int extractPlaybackId(const char *input, char out[12])
+{
+   static const char *markers[] = { "v=", "youtu.be/", "/shorts/", "/embed/", "/live/" };
+   const char *id = NULL;
+   if (!input || !input[0]) return 0;
+   for (unsigned i = 0; i < sizeof markers / sizeof markers[0]; i++) {
+      const char *hit = strstr(input, markers[i]);
+      if (hit) { id = hit + strlen(markers[i]); break; }
+   }
+   if (!id && strlen(input) == 11) id = input;
+   if (!id) return 0;
+   for (int i = 0; i < 11; i++) {
+      if (!id[i] || !playbackIdChar(id[i])) return 0;
+      out[i] = id[i];
+   }
+   out[11] = 0;
+   return 1;
+}
+
+static void appendPlaybackNavigation(const char *input)
+{
+   char id[12];
+   if (!extractPlaybackId(input, id)) return;
+
+   // If the user went back, a newly selected video starts a new forward branch.
+   if (playbackNavCursor >= 0 && playbackNavCursor < playbackNavCount - 1)
+      playbackNavCount = playbackNavCursor + 1;
+   if (playbackNavCount == PLAYBACK_NAV_CAP) {
+      memmove(playbackNavIds, playbackNavIds + 1,
+              (PLAYBACK_NAV_CAP - 1) * sizeof playbackNavIds[0]);
+      playbackNavCount--;
+      if (playbackNavCursor > 0) playbackNavCursor--;
+   }
+   if (playbackNavCount > 0 && strcmp(playbackNavIds[playbackNavCount - 1], id) == 0) {
+      playbackNavCursor = playbackNavCount - 1;
+      return;
+   }
+   strCopy(playbackNavIds[playbackNavCount++], sizeof playbackNavIds[0], id);
+   playbackNavCursor = playbackNavCount - 1;
+}
+
+static int previousPlaybackId(char out[12])
+{
+   if (playbackNavCursor <= 0) return 0;
+   playbackNavCursor--;
+   strCopy(out, 12, playbackNavIds[playbackNavCursor]);
+   return 1;
+}
+
+static int nextPlaybackId(char out[12])
+{
+   if (playbackNavCursor < 0 || playbackNavCursor >= playbackNavCount - 1) return 0;
+   playbackNavCursor++;
+   strCopy(out, 12, playbackNavIds[playbackNavCursor]);
+   return 1;
+}
+
+// Session-only autoplay history: 32 YouTube IDs (11 chars + terminator), reset on app restart.
+#define AUTOPLAY_HISTORY_CAP 32
+static char autoplayWatchedIds[AUTOPLAY_HISTORY_CAP][12];
+static int autoplayWatchedCount;
+
+static int autoplayIsIdChar(char c)
+{
+   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '-';
+}
+
+static void rememberAutoplayVideo(const char *input)
+{
+   static const char *markers[] = { "v=", "youtu.be/", "/shorts/", "/embed/", "/live/" };
+   const char *id = NULL;
+   if (!input || !input[0]) return;
+
+   for (unsigned i = 0; i < sizeof markers / sizeof markers[0]; i++) {
+      const char *hit = strstr(input, markers[i]);
+      if (hit) { id = hit + strlen(markers[i]); break; }
+   }
+   if (!id && strlen(input) == 11) id = input;
+   if (!id) return;
+
+   char videoId[12];
+   for (int i = 0; i < 11; i++) {
+      if (!id[i] || !autoplayIsIdChar(id[i])) return;
+      videoId[i] = id[i];
+   }
+   videoId[11] = 0;
+
+   for (int i = 0; i < autoplayWatchedCount; i++)
+      if (strcmp(autoplayWatchedIds[i], videoId) == 0) return;
+
+   if (autoplayWatchedCount == AUTOPLAY_HISTORY_CAP) {
+      memmove(autoplayWatchedIds, autoplayWatchedIds + 1,
+              (AUTOPLAY_HISTORY_CAP - 1) * sizeof autoplayWatchedIds[0]);
+      autoplayWatchedCount--;
+   }
+   strCopy(autoplayWatchedIds[autoplayWatchedCount++], sizeof autoplayWatchedIds[0], videoId);
+}
+
 typedef enum { STAGE_LOADING, STAGE_FAILED, STAGE_PLAYING } Stage;
 
 static struct {
@@ -446,7 +558,8 @@ static void autoplayWorker(uint64_t arg)
 {
    (void)arg;
    if (getNextVideoId(requestedInput, state.nextVideoId, sizeof state.nextVideoId,
-                      state.nextVideoTitle, sizeof state.nextVideoTitle) == 0) {
+                      state.nextVideoTitle, sizeof state.nextVideoTitle,
+                      autoplayWatchedIds, autoplayWatchedCount) == 0) {
       uint8_t *jpeg = (uint8_t *)malloc(AUTOPLAY_THUMB_CAP);
       if (jpeg) {
          char url[128];
@@ -472,10 +585,16 @@ static void autoplayWorker(uint64_t arg)
    exitThread();
 }
 
-void playVideo(const char *input)
+static void launchVideo(const char *input, int addToNavigation)
 {
    strCopy(requestedInput, sizeof requestedInput, input);
+   if (addToNavigation) appendPlaybackNavigation(input);
    pushScreen(&playScreen);
+}
+
+void playVideo(const char *input)
+{
+   launchVideo(input, 1);
 }
 
 static void initPlay(void)
@@ -794,6 +913,38 @@ static void handlePlaybackInput(void)
    if (isPadButtonPressed(PAD_BTN_TRIANGLE)) cycleSubtitles();
    if (isPadButtonPressed(PAD_BTN_L3)) cycleAudioTrack();
 
+   if (isPadButtonPressed(PAD_BTN_L1)) {
+      char previousId[12];
+      if (previousPlaybackId(previousId)) {
+         popScreen();
+         launchVideo(previousId, 0);
+         return;
+      }
+      showToast("No previous video");
+   }
+   if (isPadButtonPressed(PAD_BTN_R1)) {
+      char forwardId[12];
+      if (state.nextThreadActive || state.nextNoticeVisible) {
+         showToast("Next video is already loading");
+      } else if (nextPlaybackId(forwardId)) {
+         // Reuse the already-known forward entry before asking YouTube for another video.
+         popScreen();
+         launchVideo(forwardId, 0);
+         return;
+      } else if (state.isLive) {
+         showToast("Unavailable for live streams");
+      } else {
+         state.nextAttempted = 1;
+         state.nextWorkerDone = 0;
+         state.nextVideoId[0] = 0;
+         state.nextVideoTitle[0] = 0;
+         state.nextThreadActive = (spawnJoinableThread(&state.nextWorkerTid, autoplayWorker, 0,
+                                   THREAD_PRIORITY_DEFAULT, THREAD_STACK_SIZE_64KB, "yt-next") == 0);
+         if (!state.nextThreadActive) showToast("Next video unavailable");
+         else showToast("Loading next recommendation...");
+      }
+   }
+
    // volume: the widget steps itself on up/down; apply + persist the new level (works on live streams too)
    if (handleVolumeMeterInput(&volumeMeter)) {
       volumeLevel = volumeMeter.level;
@@ -964,6 +1115,7 @@ static void updatePlay(void)
          if (state.pauseWhenReady) setVideoPaused(state.player, 1);
          setLabelText(&titleLabel, state.title);   // rasterise once, off the draw path
          state.stage = STAGE_PLAYING;
+         rememberAutoplayVideo(requestedInput);
          if (state.audioPick >= 0 && state.audioPick < state.audioCount) { char notice[96]; snprintf(notice, sizeof notice, "Audio: %s", state.audioNames[state.audioPick]); showToast(notice); }
          else if (state.audioCount > 0) showToast("Default audio track unavailable; use L3 to choose a track");
       }
@@ -1088,7 +1240,7 @@ static void updatePlay(void)
       state.nextNoticeVisible = 0;
       if (state.nextThumbTexture.offset) retireGfxTexture(&state.nextThumbTexture);
       popScreen();
-      playVideo(nextId);
+      launchVideo(nextId, 1);
       return;
    }
 
@@ -1403,7 +1555,7 @@ static void drawAutoplayNotice(void)
    if (titleX < panelX + 30) titleX = panelX + 30;
    drawLabelAt(&nextNoticeTitleLabel, titleX, titleY);
 
-   // 24 dots form a countdown ring; the lit arc grows as the five-second delay elapses.
+   // 24 dots form a countdown ring; the lit arc grows as the three-second delay elapses.
    int cx = state.screenW / 2, cy = panelY + panelH - 32;
    int radius = 20;
    int lit = (int)(elapsed * 24.0f + 0.5f);
