@@ -155,6 +155,86 @@ static int jsonInt(const char *from, const char *end, const char *key, int *out)
    return 1;
 }
 
+// Return the end of a JSON object beginning at `start` (exclusive), respecting
+// quoted strings and escapes. This keeps diagnostic fields scoped to their object.
+static const char *jsonObjectEnd(const char *start, const char *end)
+{
+   if (!start || start >= end || *start != '{') return NULL;
+   int depth = 0, inString = 0, escaped = 0;
+   for (const char *p = start; p < end; p++) {
+      char c = *p;
+      if (inString) {
+         if (escaped) escaped = 0;
+         else if (c == '\\') escaped = 1;
+         else if (c == '"') inString = 0;
+         continue;
+      }
+      if (c == '"') inString = 1;
+      else if (c == '{') depth++;
+      else if (c == '}') {
+         depth--;
+         if (depth == 0) return p + 1;
+      }
+   }
+   return NULL;
+}
+
+static const char *jsonObjectForKey(const char *from, const char *end, const char *key,
+                                    const char **objectEnd)
+{
+   char pat[64];
+   int n = snprintf(pat, sizeof pat, "\"%s\":", key);
+   const char *p = from ? strstr(from, pat) : NULL;
+   if (!p || p >= end) return NULL;
+   p += n;
+   while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
+   if (p >= end || *p != '{') return NULL;
+   const char *close = jsonObjectEnd(p, end);
+   if (!close) return NULL;
+   if (objectEnd) *objectEnd = close;
+   return p;
+}
+
+// Copy the first few string entries from a JSON string array (e.g. messages).
+static int jsonArrayStrings(const char *from, const char *end, const char *key,
+                            char values[][192], int maxValues)
+{
+   char pat[64];
+   int n = snprintf(pat, sizeof pat, "\"%s\":", key);
+   const char *p = from ? strstr(from, pat) : NULL;
+   if (!p || p >= end) return 0;
+   p += n;
+   while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
+   if (p >= end || *p != '[') return 0;
+   p++;
+   int count = 0;
+   while (p < end && *p && *p != ']' && count < maxValues) {
+      if (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t' || *p == ',') { p++; continue; }
+      if (*p != '"') break;
+      p++;
+      int out = 0;
+      while (p < end && *p && *p != '"') {
+         char c = *p++;
+         if (c == '\\' && p < end) {
+            c = *p++;
+            if (c == 'n') c = ' ';
+            else if (c == 'r' || c == 't') c = ' ';
+            else if (c == 'u') {
+               if (p + 4 > end) break;
+               int value = hex4(p);
+               p += 4;
+               c = (value >= 0 && value <= 0x7f) ? (char)value : '?';
+            }
+         }
+         if (out < 191) values[count][out++] = c;
+      }
+      values[count][out] = 0;
+      if (p < end && *p == '"') p++;
+      count++;
+   }
+   return count;
+}
+
 static int matches(const char *input)
 {
    if (!input) return 0;
@@ -668,10 +748,43 @@ static int extract(const char *input, StreamInfo *out)
    }
 
    if (out->formatCount == 0) {
-      char statusText[32] = "";
-      const char *play = strstr(resp, "\"playabilityStatus\"");
-      jsonString(play ? play : resp, end, "status", statusText, sizeof statusText);
-      logError("[yt] no formats, respLen=%d playability=%s\n", respLen, statusText);
+      char statusText[48] = "", reason[256] = "", errorReason[256] = "";
+      char subreason[384] = "";
+      char messages[3][192] = {{0}};
+      const char *playEnd = NULL;
+      const char *play = jsonObjectForKey(resp, end, "playabilityStatus", &playEnd);
+      jsonString(play ? play : resp, play ? playEnd : end, "status", statusText, sizeof statusText);
+      if (play) {
+         jsonString(play, playEnd, "reason", reason, sizeof reason);
+         int messageCount = jsonArrayStrings(play, playEnd, "messages", messages, 3);
+         logError("[yt] no formats, respLen=%d playability=%s reason='%s'\n",
+                  respLen, statusText, reason);
+         for (int i = 0; i < messageCount; i++)
+            logError("[yt] playability message[%d]='%s'\n", i, messages[i]);
+      } else {
+         logError("[yt] no formats, respLen=%d playability=%s (playabilityStatus missing)\n",
+                  respLen, statusText);
+      }
+
+      const char *screenEnd = NULL;
+      const char *screen = jsonObjectForKey(resp, end, "errorScreen", &screenEnd);
+      const char *rendererEnd = NULL;
+      const char *renderer = screen ? jsonObjectForKey(screen, screenEnd,
+                                      "playerErrorMessageRenderer", &rendererEnd) : NULL;
+      if (renderer) {
+         const char *subEnd = NULL;
+         const char *sub = jsonObjectForKey(renderer, rendererEnd, "subreason", &subEnd);
+         jsonString(renderer, rendererEnd, "reason", errorReason, sizeof errorReason);
+         if (sub) {
+            if (!jsonString(sub, subEnd, "simpleText", subreason, sizeof subreason))
+               jsonString(sub, subEnd, "text", subreason, sizeof subreason);
+         } else {
+            subreason[0] = 0;
+         }
+         logError("[yt] errorScreen reason='%s' subreason='%s'\n", errorReason, subreason);
+      } else if (screen) {
+         logError("[yt] errorScreen present; playerErrorMessageRenderer missing\n");
+      }
       if (visitorFromDisk && strcmp(statusText, "LOGIN_REQUIRED") == 0) dropVisitorData();   // stale session
    } else {
       logInfo("[yt] resolved %d formats\n", out->formatCount);
